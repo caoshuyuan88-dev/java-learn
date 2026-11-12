@@ -7,6 +7,29 @@
 
 ## 0. 知识地图
 
+## 0.1 先用一句话理解 JVM
+
+JVM 可以先看成一个“运行 Java 程序的工厂”：
+
+```text
+.class 字节码
+    ↓ 类加载器读入
+运行时数据区（栈、堆、元空间）
+    ↓ JIT 把热点字节码编译成本地机器码
+CPU 执行
+    ↓ 堆空间不够
+GC 找出没人使用的对象并回收
+```
+
+所以学习 JVM 不要一上来背参数，可以先问四个问题：
+
+1. **数据放在哪里？** 是栈、堆、元空间，还是堆外内存？
+2. **对象怎么来的？** 是在哪里分配、什么时候晋升？
+3. **谁可以被回收？** 如何判断对象还活着？
+4. **出问题怎么查？** 看日志、线程、堆转储，还是原生内存？
+
+后面的内容都围绕这四个问题展开。
+
 | 知识点 | 重要度 | 常考形式 |
 | --- | --- | --- |
 | 运行时数据区与元空间 | ★★★★★ | 八股原理 / 版本差异 |
@@ -25,6 +48,26 @@
 ## 1. 运行时数据区与元空间
 
 ### 1.1 核心原理
+先把内存想成一栋办公楼：
+
+```text
+每个线程自己的办公桌：程序计数器、虚拟机栈、本地方法栈
+所有线程共享的仓库：堆、元空间
+楼外租用的仓库：直接内存
+```
+
+最容易混淆的一点是：**变量放在哪里，要看变量本身是什么**。局部变量表里保存的是局部变量和引用；引用可能在栈上，但引用指向的对象通常在堆上。
+
+```java
+void demo() {
+    User user = new User("Tom");
+    // user：当前线程栈帧中的引用
+    // new User(...)：通常分配在堆中的对象
+}
+```
+
+方法返回后，栈帧会消失；如果堆对象没有任何 GC Roots 再指向它，GC 才会在之后回收它。**栈帧消失不等于对象立刻回收**。
+
 | 区域 | 线程私有 | 内容 | 参数 | 溢出异常 |
 | --- | --- | --- | --- | --- |
 | 程序计数器 | 是 | 当前字节码行号（native 为 undefined） | — | 无 |
@@ -61,10 +104,47 @@
 ### 1.5 一句话速记
 - 私有：PC、虚拟机栈、本地方法栈；共享：堆、元空间、直接内存。
 - 元空间：本地内存、默认无上限、可归还 OS，溢出报 `Metaspace`。
+- 记忆法：**栈放“我正在做什么”，堆放“我创建了什么”，元空间放“有哪些类”，直接内存放“绕过堆的大块数据”**。
 
 ## 2. 对象创建、TLAB 与逃逸分析
 
 ### 2.1 核心原理
+执行 `new User()` 可以先按这条流水线理解：
+
+```text
+检查类是否已加载
+    ↓
+堆中申请空间
+    ↓
+字段先获得默认值（0、false、null）
+    ↓
+执行实例字段初始化和构造器
+    ↓
+返回对象引用
+```
+
+多个线程同时创建对象时，不能都去修改同一个“堆指针”。因此 JVM 通常先给每个线程一小块私有区域：
+
+```text
+Eden
+┌──────────────┬──────────────┬──────────────┐
+│ 线程 A TLAB  │ 线程 B TLAB  │ 线程 C TLAB  │
+└──────────────┴──────────────┴──────────────┘
+```
+
+线程在自己的 TLAB 里移动指针即可，不需要每次都 CAS。TLAB 用完了，再申请新的 TLAB；对象太大放不进去时，才走共享分配路径。
+
+逃逸分析可以理解为：**JIT 判断这个对象会不会被当前方法/线程以外的代码看到**。
+
+```java
+int sum() {
+    Point p = new Point(1, 2);
+    return p.x + p.y;
+}
+```
+
+如果 `p` 没有返回、没有存入共享字段、没有传给未知方法，JIT 可能直接把 `p.x`、`p.y` 当作两个局部值，连对象都不创建。这就是标量替换；不要把“栈上分配”理解成所有对象都会真的被放到线程栈上。
+
 分配方式：**指针碰撞**（内存整齐，如 Serial/ParNew/G1 的 Region 内）或**空闲列表**（碎片化，如 CMS）。并发安全两种方案：**TLAB**（线程在 Eden 的私有缓冲区，默认约 Eden 的 1%，可 `-XX:TLABSize` 调整，`-XX:+UseTLAB` 默认开启）或 CAS 重试。
 
 **逃逸分析**（`-XX:+DoEscapeAnalysis`，JDK 6u23 起默认开启）：不逃逸的对象可被
@@ -93,10 +173,34 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 ### 2.5 一句话速记
 - 分配：指针碰撞/空闲列表；并发安全靠 TLAB（默认开启，约 Eden 1%）。
 - 逃逸分析 → 标量替换、栈上分配、锁消除，仅 C2 热点代码生效。
+- 记忆法：**先问对象能不能被别人看到；看不到，就可能不分配、不上锁、不进堆**。
 
 ## 3. 对象分配与晋升
 
 ### 3.1 核心原理
+新生代可以想成“短期周转区”，老年代是“长期仓库”：
+
+```text
+新对象
+  ↓
+Eden：大多数对象先来这里
+  ↓ Minor GC
+Survivor：暂时活着，年龄 +1
+  ↓ 多次存活或空间不够
+老年代：长期存活对象
+```
+
+一次 Minor GC 的直观过程：
+
+```text
+Eden 中的对象逐个判断
+├─ 已无引用：丢弃
+├─ 还活着且 Survivor 放得下：复制到 Survivor，年龄 +1
+└─ Survivor 放不下或达到晋升条件：进入老年代
+```
+
+`8:1:1` 不是说每次只能使用 10% 的新生代，而是 Eden、两个 Survivor 的空间比例。两个 Survivor 轮流使用，始终有一块作为“空白接收区”。
+
 默认比例：Eden : S0 : S1 = **8 : 1 : 1**（`-XX:SurvivorRatio=8`），新生代 : 老年代 = **1 : 2**（`-XX:NewRatio=2`），即新生代占堆 1/3。
 
 规则：
@@ -120,10 +224,34 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 ### 3.5 一句话速记
 - Eden:S0:S1 = 8:1:1；默认晋升年龄 15；动态年龄判定看同年龄总和是否超 Survivor 一半。
 - 大对象直接进老年代；Minor GC 前先做空间分配担保检查。
+- 记忆法：**Eden 出生，Survivor 实习，老年代转正；空间不够可以提前转正**。
 
 ## 4. GC 算法、垃圾判定与四种引用
 
 ### 4.1 核心原理
+GC 的本质不是“把所有对象都扫描一遍然后删除”，而是回答：
+
+> 从程序仍然能够到达的入口出发，这个对象还能不能走到？
+
+```text
+GC Roots
+   ↓
+对象 A → 对象 B → 对象 C
+
+对象 X → 对象 Y
+（没有任何 Root 能到达，整条链都可能回收）
+```
+
+这就是可达性分析。对象之间即使互相引用，只要没有 GC Roots 能到达，仍然可以回收；这也是它比简单引用计数更可靠的原因。
+
+三种算法可以用“清理房间”记：
+
+```text
+标记-清除：标出要保留的，清掉其他的 → 快，但地上留下碎片
+标记-复制：把要保留的搬到另一边 → 整齐，但需要备用空间
+标记-整理：保留对象向一边搬，边界外全部清掉 → 不碎片，但搬家停顿大
+```
+
 | 算法 | 过程 | 缺点 | 使用者 |
 | --- | --- | --- | --- |
 | 标记-清除 | 标记存活 → 清除未标记 | 内存碎片、效率随对象数下降 | CMS |
@@ -158,10 +286,31 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 - 三算法：标记清除（碎片）、标记复制（新生代）、标记整理（老年代）。
 - GC Roots：栈局部变量、静态属性、常量、JNI、JVM 内部引用、锁对象。
 - 强/软/弱/虚：永不 / 内存不足 / 下次 GC / 仅通知；`finalize` 已废弃。
+- 记忆法：**Root 能走到的是活的；复制适合活得少，整理适合不能留下碎片**。
 
 ## 5. 收集器演进与选型
 
 ### 5.1 核心原理
+先不要把收集器理解成“谁最好”，它们只是不同的取舍：
+
+```text
+吞吐量：单位时间完成更多业务
+停顿时间：一次 GC 让业务暂停多久
+内存占用：GC 需要多少额外结构和空间
+
+通常不能三者同时最大化。
+```
+
+可以用“清洁工”理解：
+
+```text
+Serial：一个清洁工，简单，适合小房间
+Parallel：多个清洁工一起干活，吞吐高
+CMS：业务继续营业，清洁工并发清理，但会碎片化
+G1：把大房间分成很多小格子，优先清理垃圾最多的格子
+ZGC/Shenandoah：业务几乎不停，清洁和搬运尽量并发
+```
+
 | 收集器 | 分代 | 算法 | 停顿 | 启用参数 | 适用 |
 | --- | --- | --- | --- | --- | --- |
 | Serial / Serial Old | 新/老 | 复制 / 标记整理 | 单线程 STW | `-XX:+UseSerialGC` | 小堆 |
@@ -179,6 +328,23 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 
 **ZGC / Shenandoah**：ZGC（JDK 11 实验、**15 生产可用**、**21 分代**）用**着色指针**把标记位存在 64 位指针高位（无需在对象头存标记），**读屏障**在读取时检查并修正（并发转移自愈），几乎全阶段并发，停顿与堆大小无关；不支持压缩指针。Shenandoah 用 **Brooks 转发指针**（对象头多一个指针）实现并发转移。
 
+#### 收集器怎么选：先看目标，不背堆大小口诀
+
+```text
+只要高吞吐、延迟要求普通 → Parallel
+通用服务、希望停顿可控 → G1
+超大堆、严格低延迟 → ZGC / Shenandoah
+```
+
+选型顺序建议是：
+
+1. 先看接口 SLA，例如 P99 能否容忍 100ms 停顿；
+2. 再看堆大小和对象分配速度；
+3. 再看 Full GC 是否能接受；
+4. 最后用压测和 GC 日志验证，而不是只按“4GB 用什么、16GB 用什么”机械选择。
+
+`MaxGCPauseMillis` 是 G1 的软目标，不是“保证每次都不超过这个数”。目标设得过小，G1 可能每次只回收很少的 Region，最终吞吐下降。
+
 ### 5.2 面试问答
 **Q1：怎么选收集器？** A：堆 < 4GB 且无延迟要求用 Parallel；4GB~数十 GB、延迟敏感用 G1（通用首选）；超大堆或 P99 < 10ms 用 ZGC（注意不能开压缩指针）。
 **Q2：Concurrent Mode Failure 怎么解？** A：降低 `CMSInitiatingOccupancyFraction`（如 70~75%）、增大老年代与新生代、降低晋升速度、`-XX:+CMSScavengeBeforeRemark`，终极方案换 G1（CMS 已移除）。
@@ -193,10 +359,29 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 ### 5.5 一句话速记
 - 吞吐优先 Parallel；通用低延迟 G1（JDK 9 默认）；超大堆超低延迟 ZGC（JDK 15 生产可用、21 分代）。
 - CMS 四阶段：初始标记（STW）→ 并发标记 → 重新标记（STW）→ 并发清除；致命伤是 CMF 与碎片。
+- 记忆法：**Parallel 拼速度，G1 拼可预测，ZGC/Shenandoah 拼低停顿；没有“永远最好”的收集器**。
 
 ## 6. 三色标记、记忆集与卡表
 
 ### 6.1 核心原理
+并发 GC 最大的难题是：GC 在看对象图时，业务线程还在修改对象引用。
+
+三色可以想成三种工作状态：
+
+```text
+白：还没看过
+灰：看过自己，但孩子还没看完
+黑：自己和孩子都看完了
+```
+
+理想流程是：
+
+```text
+白对象 → 放入灰色待处理队列 → 扫描孩子 → 变黑
+```
+
+如果一个黑对象后来指向白对象，而 GC 又错过了这条变化，就可能漏标。并发收集器通过写屏障记录变化，等并发标记结束后再补处理。
+
 三色标记：白色（未访问）、灰色（自身访问过、成员未访问完）、黑色（自身与成员都访问完）。
 
 **漏标只发生在并发标记阶段**，需同时满足两个条件：① 黑色对象新增了指向白色对象的引用；② 该白色对象到灰色对象的引用被删除。两个解法的差异：
@@ -205,24 +390,131 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 
 **记忆集与卡表**：卡表是字节数组，把堆按 512 字节分为卡页（`-XX:CardTableShift`）；对象引用字段赋值时通过**写屏障**把对应卡页标记为 dirty，GC 时只扫描脏卡对应区域。G1 在卡表之上为每个 Region 维护 RSet（哈希表 + 优化），因此它的写屏障开销高于 CMS。
 
+记忆集可以理解成“反向通讯录”：
+
+```text
+Region B 中的对象指向 Region A
+GC 只回收 Region A
+→ 不必扫描整个堆，只需查 A 的 RSet，找到谁可能指向 A
+```
+
+卡表是“哪一小块区域发生过引用写入”的粗粒度目录，RSet 是“哪些地方指向我”的更具体记录。两者有关，但不是同一个东西。
+
+#### 哪些收集器使用三色标记？
+
+先区分两个层次：
+
+```text
+三色标记：描述“如何遍历对象图”的通用思想
+并发标记：GC 标记时业务线程仍在运行，需要写屏障防漏标
+```
+
+因此，使用可达性分析的追踪式收集器，都可以用三色思想理解对象标记；但面试中最常提到三色标记和漏标问题的，是**带并发标记阶段**的收集器：
+
+| 收集器 | 是否可用三色思想理解 | 并发标记时的典型处理 |
+| --- | --- | --- |
+| Serial / Parallel | 可以，但主要是 STW 标记，业务线程暂停，漏标问题不突出 | 不需要为并发标记设计复杂屏障 |
+| CMS | 是 | 增量更新，记录黑对象新增的引用 |
+| G1 | 是 | SATB，记录并发标记期间被删除的旧引用 |
+| ZGC | 是 | 并发标记 + 读屏障/写屏障，具体实现比传统三色模型更复杂 |
+| Shenandoah | 是 | 并发标记 + 写屏障/转发指针 |
+| Epsilon | 否 | 不回收，不做完整的垃圾标记 |
+
+可以这样回答面试题：
+
+> 三色标记不是某一个收集器专属的算法，而是追踪式 GC 描述对象可达状态的通用模型。Serial、Parallel 也可以用它理解，但因为主要是 STW，业务线程不会同时修改引用；CMS、G1、ZGC、Shenandoah 的并发标记阶段才重点涉及漏标、写屏障和重新标记。
+
+#### 记忆集、卡表、RSet 到底是什么关系？
+
+可以按“总称 → 粗略目录 → 具体反向记录”理解：
+
+```text
+记忆集（Remembered Set）
+    ↓ 一种思想/数据结构：记录外部有哪些引用指向当前回收范围
+卡表（Card Table）
+    ↓ 粗粒度目录：哪些堆卡片最近发生过引用写入
+RSet（G1 Remembered Set）
+    ↓ G1 为每个 Region 维护的“谁指向我”的记录
+```
+
+假设老年代对象 `old` 指向新生代对象 `young`：
+
+```java
+class Holder {
+    Object reference;
+}
+
+Holder old = longLivedHolder();
+Object young = new Object();
+old.reference = young;
+```
+
+如果只回收新生代，GC 不应该扫描整个老年代来寻找 `old → young`。JVM 会在引用赋值时通过写屏障记录这次变化：
+
+```text
+old.reference = young
+        ↓
+写屏障标记相关卡页为 dirty
+        ↓ Minor GC
+只扫描 dirty 卡页中的候选老对象
+        ↓
+把 old 作为额外根，找到 young
+```
+
+对 G1 来说，堆被分成多个 Region。假设 Region B 中的对象指向 Region A：
+
+```text
+Region B ─────引用────> Region A
+                         ↑
+                    本次准备回收
+```
+
+Region A 的 RSet 会记录“Region B 可能有对象指向我”。回收 Region A 时，G1 先查 RSet，而不是扫描整个堆。
+
+三者的区别可以这样记：
+
+| 名称 | 解决什么问题 | 记录粒度 | 形象比喻 |
+| --- | --- | --- | --- |
+| 记忆集 | 记录回收范围外指向范围内的引用 | 抽象概念/数据结构 | 反向通讯录 |
+| 卡表 | 快速标记哪些区域发生过引用写入 | 粗粒度卡片，常见约 512B | 脏区域索引 |
+| RSet | G1 记录哪些 Region 可能指向当前 Region | 按 Region 的反向记录 | 每个 Region 的来访名单 |
+
+注意：卡表不是 RSet，RSet 也不等于简单的一张卡表。G1 通常借助卡表发现变化，再维护更具体的 RSet；这也是 G1 需要额外内存和写屏障开销的原因。
+
 ### 6.2 面试问答
 **Q1：为什么需要记忆集？** A：跨代引用极少（假说），若 Minor GC 扫整个老年代代价太大；记忆集把"老年代指向新生代"的引用记下来，只把这些老对象加入 GC Roots。
 **Q2：写屏障的开销体现在哪？** A：每次引用字段赋值都多一次记录操作，G1 的 RSet 维护比 CMS 的卡表更贵，这是 G1 写吞吐略低的原因之一。
 **Q3：SATB 为什么产生浮动垃圾？** A：快照把标记开始时活着的对象都视为存活，期间新死亡的对象本轮不回收。
 **Q4：增量更新与 SATB 哪个更好？** A：没有绝对优劣 —— 增量更新重扫成本随黑色对象写操作量增长，SATB 有浮动垃圾但停顿更可控，因此 G1/ZGC 选 SATB。
+**Q5：三色标记是不是只有 G1 使用？** A：不是。它是追踪式 GC 的通用理解模型；CMS、G1、ZGC、Shenandoah 的并发标记会重点使用相关屏障来避免漏标。
+**Q6：记忆集和卡表是不是一回事？** A：不是。记忆集是“记录外部引用”的抽象结构，卡表是把堆划成卡片并标记脏卡的粗粒度实现，G1 还会为 Region 维护更具体的 RSet。
 
 ### 6.3 高频追问与陷阱
 - 陷阱：漏标必须两个条件同时满足，只说其一会被追问到答不上。
 - 陷阱：卡表与 RSet 不是一回事，RSet 是"每个 Region 一份的记录集合"，卡表是全堆共享的字节数组。
 - 错误回答："CMS 用 SATB"（CMS 用增量更新）。
+- 错误回答："三色标记就是一种只属于 G1 的 GC 算法"（它是追踪式标记的通用模型）。
 
 ### 6.5 一句话速记
 - 漏标两条件：黑色新增指向白色 + 白色到灰色的引用被删。
 - 增量更新记新增（CMS），SATB 记删除（G1），SATB 产生浮动垃圾。
+- 记忆法：**白色没看、灰色待看、黑色看完；写屏障负责告诉 GC“业务刚改过引用”**。
+- 记忆法：**记忆集是总称，卡表记“哪里变脏”，RSet 记“谁指向我”**。
 
 ## 7. JVM 参数与 GC 日志
 
 ### 7.1 核心原理
+JVM 参数不要按“看到就背”来学，可以按四个问题分类：
+
+```text
+堆有多大？       -Xms / -Xmx
+线程和类有多大？  -Xss / MaxMetaspaceSize
+谁来回收？       UseG1GC / UseParallelGC / UseZGC
+出问题怎么留证？  GC 日志 / HeapDump / NMT
+```
+
+一个参数是否有效，还要看 JDK 版本和当前收集器。最典型的例子是：`-Xmn` 对 G1 不适合作为固定新生代配置，JDK 9 以后 GC 日志也不能继续照搬 JDK 8 参数。
+
 | 分类 | 参数 | 含义 |
 | --- | --- | --- |
 | 堆 | `-Xms/-Xmx` | 初始/最大堆（生产设相等，避免动态扩缩抖动） |
@@ -241,6 +533,22 @@ public int distance() { Point p = new Point(1, 2); return p.x + p.y; }  // Point
 ```
 G1 日志读法示例：`GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M->128M(2048M) 12.345ms` —— 依次是编号、类型、触发原因、回收前→回收后（堆总量）、停顿毫秒。**关键判断**：有无 `Pause Full`、单次停顿是否超 `MaxGCPauseMillis`、回收后占用是否持续上升（泄漏信号）。
 
+读一行 GC 日志时只做三件事：
+
+```text
+1. 这是什么 GC？Young、Mixed 还是 Full？
+2. GC 前后降了多少？如果几乎不降，可能有泄漏或晋升压力。
+3. 花了多久？频率 × 单次停顿，才是对业务的真实影响。
+```
+
+例如：
+
+```text
+512M -> 128M，耗时 12ms
+```
+
+说明这次释放了约 384M，且停顿不长；如果长期变成 `1900M -> 1890M`，即使单次只停顿几十毫秒，也要警惕堆中对象无法回收。
+
 ### 7.2 面试问答
 **Q1：容器里怎么设堆？** A：JDK 8u191+/10+ 支持 `UseContainerSupport`（默认开启），用 `-XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=70` 替代固定值；JDK 8u131~8u190 需手动 `-XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap`，否则按宿主机内存算堆被 OOMKilled。
 **Q2：怎么判断发生了 Full GC？** A：JDK 8 日志里搜 `Full GC`；JDK 9+ 搜 `Pause Full`；或 `jstat -gc <pid> 1000` 观察 `FGC`/`FGCT` 是否增长。
@@ -256,10 +564,197 @@ G1 日志读法示例：`GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M-
 - `-Xms = -Xmx`；元空间必须设上限；OOM 自动 dump 必须开。
 - JDK 8 用 `PrintGCDetails/Xloggc`，JDK 9+ 用 `-Xlog:gc*:file=...`。
 - 容器用 `MaxRAMPercentage`，只有 JDK 8u191+ 才正确识别 cgroup。
+- 记忆法：**参数先问大小，再问收集器，最后问怎么留下证据**。
 
 ## 8. 类加载机制与双亲委派
 
 ### 8.1 核心原理
+类加载可以理解成“把一份 class 文件变成 JVM 能使用的 `Class` 对象”：
+
+```text
+找到字节流
+  ↓
+检查是否合法
+  ↓
+为静态字段准备空间并写零值
+  ↓
+把符号引用解析成实际引用
+  ↓
+执行静态初始化代码
+```
+
+例如：
+
+```java
+class Config {
+    static int port = 8080;
+    static {
+        System.out.println("init");
+    }
+}
+```
+
+准备阶段 `port` 先是 `0`，初始化阶段才执行 `port = 8080` 和静态代码块。编译期常量 `static final int PORT = 8080` 则可能在准备阶段直接得到最终值。
+
+双亲委派可以先记成“先问家长”：
+
+```text
+应用类加载器
+    ↓ 先交给平台/启动类加载器
+父加载器找得到 → 父加载器加载
+父加载器找不到 → 子加载器自己尝试
+```
+
+这样可以避免应用自己伪造 `java.lang.String`，也让核心类尽量由同一个加载器加载。
+
+#### 一次 `loadClass` 到底先做什么、后做什么？
+
+假设代码执行：
+
+```java
+Class<?> type = Class.forName("com.example.User");
+```
+
+可以把过程拆成下面 7 步。这里先忽略缓存细节，先记住主流程：
+
+```text
+第 1 步：当前类加载器收到“加载 User”的请求
+    ↓
+第 2 步：先检查自己以前是否已经加载过 User
+    ├─ 已加载：直接返回已有的 Class 对象
+    └─ 未加载：继续
+    ↓
+第 3 步：把请求交给父类加载器
+    ↓
+第 4 步：父类加载器继续重复“查缓存 → 问它的父加载器”
+    ↓
+第 5 步：最上面的 Bootstrap 先尝试查找
+    ├─ 找到：由 Bootstrap 加载并返回
+    └─ 找不到：返回“我加载不了”
+    ↓
+第 6 步：父加载器都找不到，子加载器才自己查 classpath
+    ├─ 找到字节码：定义 Class 对象并返回
+    └─ 找不到：抛出 ClassNotFoundException
+    ↓
+第 7 步：如果是 Class.forName，继续触发初始化
+```
+
+注意第 3 步和第 6 步，这就是“委派”的核心：
+
+```text
+子加载器不是先自己找，而是先问父加载器；
+只有父加载器明确找不到，子加载器才自己找。
+```
+
+以常见的加载器层次为例：
+
+```text
+Bootstrap ClassLoader
+        ↑
+Platform ClassLoader
+        ↑
+Application ClassLoader
+        ↑
+Custom ClassLoader
+```
+
+请求从下往上传：
+
+```text
+Custom → Application → Platform → Bootstrap
+```
+
+查找失败后，再从上往下返回：
+
+```text
+Bootstrap 找不到
+    ↓
+Platform 找不到
+    ↓
+Application 找不到
+    ↓
+Custom 自己查找
+```
+
+可以把 `ClassLoader.loadClass` 的核心逻辑简化成：
+
+```java
+Class<?> loadClass(String name) throws ClassNotFoundException {
+    // 1. 先查当前加载器是否已经加载过
+    Class<?> loaded = findLoadedClass(name);
+    if (loaded != null) {
+        return loaded;
+    }
+
+    // 2. 优先让父加载器尝试
+    if (parent != null) {
+        try {
+            return parent.loadClass(name);
+        } catch (ClassNotFoundException ignored) {
+            // 父加载器找不到，当前加载器才继续
+        }
+    }
+
+    // 3. 父加载器都失败后，当前加载器自己查找字节码
+    return findClass(name);
+}
+```
+
+`findClass` 通常负责“找到字节码并调用 `defineClass` 定义类”，而不是负责父子委派。自定义类加载器一般只需要重写 `findClass`，这样更不容易破坏双亲委派。
+
+#### 为什么要先问父加载器？
+
+假设应用目录里放了一个自定义的 `java.lang.String`：
+
+```text
+如果子加载器先自己查找：
+应用可能加载自己的 java.lang.String
+    ↓
+核心类被替换，类型体系和安全边界被破坏
+```
+
+使用双亲委派后：
+
+```text
+请求 java.lang.String
+    ↓
+先交给 Bootstrap
+    ↓
+Bootstrap 加载 JDK 自带 String
+    ↓
+应用自己的同名类没有机会冒充核心类
+```
+
+它主要解决三个问题：
+
+1. **核心类安全**：应用不能轻易替换 `java.lang.*` 等核心类；
+2. **避免重复加载**：同一层级优先复用已经加载的 Class；
+3. **保证类型一致**：核心类尽量由同一个加载器定义。
+
+#### “加载”和“初始化”不是一回事
+
+双亲委派解决的是“由哪个类加载器找到并定义类”，不等于立即执行静态代码：
+
+```java
+ClassLoader loader = Thread.currentThread().getContextClassLoader();
+Class<?> type = loader.loadClass("com.example.User");
+// 通常只加载，不主动执行 User 的静态初始化代码
+```
+
+而：
+
+```java
+Class<?> type = Class.forName("com.example.User");
+// 默认会继续触发初始化，执行 static 字段赋值和 static 代码块
+```
+
+可以记成：
+
+```text
+loadClass：先把“类的说明书”读进来
+Class.forName：读进来后，默认还要执行静态初始化
+```
+
 五阶段：加载 → 验证 → 准备 → 解析 → 初始化（+ 使用 + 卸载）。
 | 阶段 | 关键动作 |
 | --- | --- |
@@ -284,6 +779,8 @@ G1 日志读法示例：`GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M-
 **Q3：Tomcat 为什么打破双亲委派？** A：应用隔离（不同应用可用不同版本的同一库）、热部署（丢弃整个 WebApp 加载器实现类卸载）、优先使用应用自带库版本。
 **Q4：类什么时候能被卸载？** A：该类的所有实例被回收、`Class` 对象无引用、加载它的 `ClassLoader` 被回收。因此加载器泄漏（Tomcat 热部署、ThreadLocal 持有 WebApp 类、JDBC 驱动/MBean 注册）会导致**元空间 OOM**。
 **Q5：JPMS（JDK 9）的影响？** A：Extension 加载器被 Platform 取代；模块用 `requires/exports/opens` 声明；JDK 16 起默认强封装，反射访问内部 API 需 `--add-opens`。
+**Q6：为什么自定义类加载器通常重写 `findClass`，而不是直接重写 `loadClass`？** A：`loadClass` 中包含“先查自己、再问父加载器、父失败后自己查找”的委派流程；只重写 `findClass` 可以复用这套流程，直接重写 `loadClass` 容易破坏双亲委派。
+**Q7：`loadClass` 找到类后会立即执行静态代码块吗？** A：通常不会。`loadClass` 主要负责加载；`Class.forName` 默认还会触发初始化，执行 `<clinit>`。
 
 ### 8.3 高频追问与陷阱
 - 陷阱：`static int a = 10` 在准备阶段为 0，初始化阶段才变 10；`static final int A = 10` 在准备阶段就是 10。
@@ -294,10 +791,25 @@ G1 日志读法示例：`GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M-
 - 五阶段：加载、验证、准备（零值）、解析、初始化（`<clinit>`）。
 - 打破双亲委派的场景：SPI（TCCL）、Tomcat（WebApp 优先）、热部署（新加载器）。
 - 类唯一标识 = ClassLoader + 全限定名。
+- 记忆法：**先找文件，再验身份，再给静态字段留位置，最后执行静态代码；双亲委派先问家长，家长找不到子类再找**。
 
 ## 9. 字节码基础
 
 ### 9.1 核心原理
+字节码可以看成 JVM 的“中间语言”。Java 源码中的语法糖，最终都会变成一串指令：
+
+```text
+局部变量表 ⇄ 操作数栈 ⇄ 方法调用
+```
+
+例如 `int c = a + b` 大致是：
+
+```text
+iload a → iload b → iadd → istore c
+```
+
+`javap -c -v -p Demo.class` 的价值不是背每条指令，而是验证“源码看起来简单，编译后到底做了什么”。
+
 字节码结构：魔数 `0xCAFEBABE` + 版本号 + 常量池 + 访问标志 + 字段/方法表 + 属性表；用 `javap -v -p Xxx.class` 查看。
 
 | 指令 | 说明 |
@@ -326,10 +838,33 @@ G1 日志读法示例：`GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M-
 ### 9.5 一句话速记
 - 静态绑定：`invokestatic`、`invokespecial`；动态绑定：`invokevirtual`、`invokeinterface`、`invokedynamic`。
 - `javap -v` 是验证语法糖（switch String、lambda、泛型桥接）的标准手段。
+- 记忆法：**先把值压栈，再执行指令；`invokevirtual` 看运行时对象，`invokestatic/invokespecial` 看编译期关系**。
 
 ## 10. 排查工具
 
 ### 10.1 核心原理
+排查工具不是越多越好，而是要和问题对应：
+
+```text
+进程还活着吗？       jps
+GC 是否异常？         jstat / GC 日志
+哪个线程忙或被卡住？  jstack / Arthas thread
+哪些对象占内存？      jmap / jcmd / MAT
+CPU 到底热点在哪？    async-profiler / JFR
+```
+
+建议先低成本观察，再做可能触发停顿的操作：
+
+```text
+jstat / dashboard
+    ↓
+jstack / thread
+    ↓
+GC 日志、JFR
+    ↓
+dump、MAT（最后使用，注意 STW 和文件敏感性）
+```
+
 | 工具 | 用途 | 常用命令 |
 | --- | --- | --- |
 | `jps` | 列出 Java 进程 | `jps -l -m -v` |
@@ -367,10 +902,29 @@ jstack 12345 | grep -A 30 "nid=0x303a"    # 定位对应栈
 ### 10.5 一句话速记
 - `jstat -gcutil` 看 YGC/FGC/GCT；`jmap -histo:live` 会 Full GC；dump 分析用 MAT 支配树。
 - Arthas 四件套：`dashboard`、`thread -n/-b`、`jad`、`watch`/`trace`。
+- 记忆法：**先看现象，再找线程，再看对象，最后用 dump 证明持有链**。
 
 ## 11. OOM、CPU 100% 与内存泄漏排查
 
 ### 11.1 核心原理
+OOM 和 CPU 高不要直接猜“堆太小”或“代码死循环”，先根据现象分类：
+
+```text
+异常日志 → 判断是哪块内存
+CPU 飙高 → 判断是业务、GC、锁竞争还是线程过多
+堆持续上涨 → 区分正常流量增长和真正泄漏
+```
+
+内存泄漏的关键不是“对象很多”，而是：
+
+```text
+对象已经没用了
+    但仍被某条 GC Roots → 持有链引用
+    所以 GC 不敢回收
+```
+
+MAT 的 `Path to GC Roots` 就是在回答：“到底是谁还抓着这个对象不放？”
+
 | 异常信息 | 区域 | 常见原因 | 排查手段 |
 | --- | --- | --- | --- |
 | `Java heap space` | 堆 | 大对象、缓存无上限、内存泄漏 | dump + MAT 支配树与 GC Roots 路径 |
@@ -400,10 +954,35 @@ jstack 12345 | grep -A 30 "nid=0x303a"    # 定位对应栈
 - 六类 OOM：堆、GC overhead、Metaspace、直接内存、native thread、栈；先看日志关键短语。
 - CPU 高先分类：业务死循环、GC、锁竞争、线程过多；用 `top -Hp` + `jstack nid` 或 `thread -n`。
 - 泄漏三件套：GC 后老年代递增 → dump → MAT 支配树 + Path to GC Roots。
+- 记忆法：**先分类，后取证；先找谁持有，再决定加内存还是改代码**。
 
 ## 12. 调优参数模板与版本变化
 
 ### 12.1 核心原理
+调优不是“试几个参数直到不报错”，而是一次实验：
+
+```text
+明确目标
+  ↓
+记录基线（吞吐、P99、YGC/FGC、GC 后堆占用）
+  ↓
+压测或复现
+  ↓
+只改少量参数
+  ↓
+对比结果，保留有效改动
+```
+
+例如看到 Full GC 频繁，不能直接把 `-Xmx` 加大。要先确认：
+
+```text
+是活对象真的超过堆容量？
+是短时间分配太快？
+是大对象/Humongous？
+是元空间或显式 System.gc()？
+还是对象泄漏？
+```
+
 **4C8G（中小业务，G1，JDK 17）**：`-Xms4g -Xmx4g`（limit 的 50%，留足堆外）、`-XX:MetaspaceSize=256m -XX:MaxMetaspaceSize=512m`、`-Xss512k`、`-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:G1HeapRegionSize=4m`、`-XX:ParallelGCThreads=4 -XX:ConcGCThreads=1`、`-XX:+HeapDumpOnOutOfMemoryError`、`-Xlog:gc*:file=/data/log/gc.log:time,uptime,level,tags:filecount=10,filesize=50M`、`-XX:+DisableExplicitGC`。
 
 **8C16G（核心服务，G1，JDK 17）**：`-Xms10g -Xmx10g`、元空间 256m/512m、`-XX:G1HeapRegionSize=8m`、`-XX:InitiatingHeapOccupancyPercent=45 -XX:+G1UseAdaptiveIHOP`、`-XX:ParallelGCThreads=8 -XX:ConcGCThreads=2`、`-XX:+AlwaysPreTouch`、其余同上。
@@ -440,6 +1019,7 @@ jstack 12345 | grep -A 30 "nid=0x303a"    # 定位对应栈
 - 4C8G：`-Xms4g -Xmx4g` + G1 + 元空间 512m；8C16G：`-Xms10g -Xmx10g` + `ParallelGCThreads=8`。
 - 调优顺序：定目标 → 度量 → 压测 → 定位 → 调参 → 复测；代码优化优先于调参。
 - 版本：JDK 9 G1 默认、11 ZGC 实验、14 CMS 移除、15 ZGC 生产可用、21 分代 ZGC。
+- 记忆法：**先测量再调参，一次只改少量参数；代码分配率和泄漏问题优先于 JVM 参数**。
 
 ## 自测题（含答案要点）
 

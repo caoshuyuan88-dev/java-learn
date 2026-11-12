@@ -23,6 +23,43 @@
 ## 1. Lambda 与函数式接口
 
 ### 1.1 核心原理
+先用人话理解 Lambda：它不是“一个神秘的新对象”，而是把一小段“要做什么”的代码当成参数传给别人。
+
+```java
+// 普通写法：把完整的遍历过程写出来
+for (String name : names) {
+    System.out.println(name);
+}
+
+// Lambda：只告诉 forEach“每个元素要做什么”
+names.forEach(name -> System.out.println(name));
+```
+
+`name -> System.out.println(name)` 可以读成：
+
+```text
+拿到一个 name
+→ 执行 println(name)
+```
+
+Lambda 必须放在一个**函数式接口**需要它的地方。函数式接口就是“只有一个抽象方法的接口”，这个唯一方法决定了 Lambda 的参数和返回值类型。
+
+```java
+Predicate<String> longName = name -> name.length() > 5;
+Function<String, Integer> length = String::length;
+Consumer<String> print = System.out::println;
+Supplier<String> defaultName = () -> "unknown";
+```
+
+可以这样记：
+
+```text
+Predicate：问问题，返回 true/false
+Function：输入一个值，转换成另一个值
+Consumer：拿到值后消费，不返回结果
+Supplier：不接收参数，负责提供一个值
+```
+
 Lambda 的编译目标是**函数式接口**（只有一个抽象方法的接口）；编译产物是 `invokedynamic` + `LambdaMetafactory`，运行期通过方法句柄生成实现类，**不产生 `Xxx$1.class`**（`javap -v` 可见 `InvokeDynamic #0:apply:()...`）。
 
 | 接口 | 签名 | 变异版本 | 用途 |
@@ -54,6 +91,144 @@ Lambda 与匿名内部类的差异：Lambda 用 invokedynamic 且 `this` 指向*
 ## 2. Stream 惰性求值、短路与并行流
 
 ### 2.1 核心原理
+#### 先用人话理解 Stream
+
+Stream 不是一个新集合，也不是把数据复制一份。它更像一条“数据加工流水线”：
+
+```text
+原始集合
+  ↓
+过滤不需要的数据
+  ↓
+转换数据形状
+  ↓
+排序/去重/截取
+  ↓
+得到结果
+```
+
+例如业务需求是“找出金额大于 100 的订单编号”：
+
+```java
+List<String> ids = orders.stream()
+        .filter(order -> order.getAmount() > 100)
+        .map(Order::getId)
+        .toList();
+```
+
+这段代码可以翻译成人话：
+
+```text
+从 orders 开一条流水线
+→ 只保留金额大于 100 的订单
+→ 每个订单只取 id
+→ 把最终结果收集成 List
+```
+
+Stream 关注的是“数据要经过哪些步骤”；普通 `for` 循环关注的是“我现在如何控制下标、临时变量和遍历过程”。
+
+#### Stream 的完整执行流程
+
+Stream 通常分成三段：
+
+```text
+数据源 Source
+    ↓
+中间操作 Intermediate Operations
+    ↓
+终端操作 Terminal Operation
+```
+
+以这段代码为例：
+
+```java
+long count = orders.stream()
+        .filter(order -> order.getAmount() > 100)
+        .map(Order::getId)
+        .distinct()
+        .limit(10)
+        .count();
+```
+
+执行过程不是“先把所有订单 filter 完，再把全部结果 map 完”。更接近下面这样：
+
+```text
+订单 1 → filter → map → distinct → limit → count
+订单 2 → filter → map → distinct → limit → count
+订单 3 → filter → map → distinct → limit → count
+...
+```
+
+这叫**垂直执行**。只有遇到终端操作 `count()`，前面的操作才真正开始执行。
+
+```text
+只有 stream + filter + map：
+    什么都不执行
+
+加上 count/collect/forEach：
+    开始拉取元素，逐个通过流水线
+```
+
+每个阶段可以这样理解：
+
+1. `stream()`：创建流水线，不读取全部数据；
+2. `filter`：定义筛选规则；
+3. `map`：定义转换规则；
+4. `distinct`：需要记住已经出现过的元素；
+5. `limit`：达到数量后停止继续读取；
+6. `count`：启动流水线并汇总结果。
+
+#### Stream 和普通循环有什么区别？
+
+同一个需求用两种写法对比：
+
+```java
+// 普通循环
+List<String> result = new ArrayList<>();
+for (Order order : orders) {
+    if (order.getAmount() > 100) {
+        result.add(order.getId());
+    }
+}
+```
+
+```java
+// Stream
+List<String> result = orders.stream()
+        .filter(order -> order.getAmount() > 100)
+        .map(Order::getId)
+        .toList();
+```
+
+区别不在于 Stream 一定更快，而在于关注点不同：
+
+| 对比 | 普通循环 | Stream |
+| --- | --- | --- |
+| 关注重点 | 如何遍历、如何修改结果 | 数据经过哪些处理步骤 |
+| 中间结果 | 常需要手动创建临时集合 | 由流水线连接 |
+| 提前结束 | 手动 `break`/`return` | `findFirst`/`limit` 等短路操作 |
+| 可读性 | 简单流程直观，复杂流程容易嵌套 | 转换、过滤、分组表达清晰 |
+| 调试 | 可以逐行断点 | 链过长时定位较困难 |
+| 性能 | 小数据、简单循环通常更直接 | 可能减少中间集合，适合组合处理 |
+| 控制能力 | 可随时修改外部状态 | 鼓励无副作用、声明式处理 |
+
+选择原则：
+
+```text
+简单遍历、需要复杂 break、频繁修改外部状态 → 普通循环
+过滤 + 转换 + 分组 + 汇总等数据处理 → Stream
+```
+
+#### Stream 的优势到底在哪里？
+
+1. **把业务意图写出来**：`filter`、`map`、`groupingBy` 比多个临时变量更接近需求；
+2. **操作可以组合**：过滤、转换、排序、分组可以拼成一条流程；
+3. **惰性和短路**：配合 `limit`、`findFirst`，不必处理全部数据；
+4. **减少中间集合**：许多操作可以在一条流水线中完成；
+5. **有并行扩展能力**：部分无状态、计算密集任务可以改成并行流。
+
+但 Stream 不是“代码更短就一定更好”：链条太长、需要复杂分支、需要修改外部变量时，普通循环通常更容易读和调试。
+
 - **创建**：`collection.stream()`、`Arrays.stream(arr)`、`Stream.of`、`Stream.iterate/generate`、`IntStream.range`、`Files.lines`。
 - **中间操作（惰性）**：`filter`、`map`、`flatMap`、`distinct`、`sorted`、`limit`、`skip`、`peek`、`mapToInt/mapToObj`、`boxed`。
 - **终端操作（触发执行）**：`forEach`、`collect`、`reduce`、`count`、`anyMatch/allMatch/noneMatch`、`findFirst/findAny`、`min/max`、`toArray`。
@@ -63,6 +238,55 @@ Lambda 与匿名内部类的差异：Lambda 用 invokedynamic 且 `this` 指向*
 Stream.iterate(1, i -> i + 1).filter(i -> i % 3 == 0).limit(5).forEach(System.out::println);  // 3 6 9 12 15
 ```
 流**只能消费一次**，重复消费抛 `IllegalStateException: stream has already been operated upon or closed`。
+
+#### 为什么 `limit` 可以提前停止？
+
+因为 Stream 会沿流水线逐个处理元素。下面的无限流不会死循环：
+
+```java
+List<Integer> values = Stream.iterate(1, i -> i + 1)
+        .filter(i -> i % 2 == 0)
+        .limit(3)
+        .toList();
+// [2, 4, 6]
+```
+
+处理到第 6 个元素后，`limit(3)` 已经满足要求，终端操作可以结束。这里的关键不是 `filter` 很快，而是 `limit` 发出了“够了，停止拉取”的信号。
+
+但 `sorted()`、`distinct()` 这类有状态操作通常需要先看到更多甚至全部元素：
+
+```text
+filter/limit：可以边读边决定，容易短路
+sorted：不知道后面有没有更小的值，通常要先收集再排序
+distinct：要记住已见过的值
+```
+
+#### 一个元素是怎样流过 Stream 的？
+
+```java
+List<String> result = names.stream()
+        .filter(name -> {
+            System.out.println("filter: " + name);
+            return name.length() >= 4;
+        })
+        .map(name -> {
+            System.out.println("map: " + name);
+            return name.toUpperCase();
+        })
+        .limit(2)
+        .toList();
+```
+
+可能的处理顺序是：
+
+```text
+Tom     → filter（失败）
+Alice   → filter（成功）→ map → limit 计数 1
+Bob     → filter（失败）
+Jerry   → filter（成功）→ map → limit 计数 2 → 停止
+```
+
+它不会先把所有名字 filter 一遍，再统一 map；这就是 Stream 的“垂直执行 + 惰性求值”。
 
 **并行流**：`parallelStream()` 底层是 `ForkJoinPool.commonPool()`（并行度 = CPU 核数 - 1）。适用条件：数据量大（数万元以上）、计算密集无阻塞、无共享可变状态、满足结合律。`findFirst` 在并行流上开销大（需保证遇到顺序），用 `findAny`；并行 `forEach` 不保证顺序，要顺序用 `forEachOrdered`。
 
@@ -90,10 +314,37 @@ long total = orders.stream().mapToLong(Order::getAmount).sum();     // 避免 in
 ### 2.5 一句话速记
 - 中间操作惰性、终端操作触发；垂直执行使 `limit` 能短路。
 - 流只能消费一次；并行流默认用 commonPool（CPU-1），别做 IO。
+- 记忆法：**先搭流水线，终端操作才开工；一个元素走到底，够了就停止**。
 
 ## 3. Collectors 速查
 
 ### 3.1 核心原理
+`Stream` 负责“逐个处理元素”，`Collector` 负责“把处理结果装回一个最终结构”：
+
+```text
+Stream：数据怎么流动？
+Collector：数据最后装在哪里？
+```
+
+例如：
+
+```java
+Map<String, List<Order>> byCity = orders.stream()
+        .collect(Collectors.groupingBy(Order::getCity));
+```
+
+执行过程可以理解为：
+
+```text
+读取一个订单
+→ 取出城市
+→ 找到该城市对应的 List
+→ 把订单放进去
+→ 继续读取下一个订单
+```
+
+`groupingBy` 不是简单排序，而是创建 `Map<分组键, 分组结果>`；`partitioningBy` 则固定分成 `true` 和 `false` 两组。
+
 | 需求 | 写法 |
 | --- | --- |
 | List / Set | `Collectors.toList()`、`toSet()`、`toUnmodifiableList()`（JDK 10+） |
@@ -127,6 +378,26 @@ long total = orders.stream().mapToLong(Order::getAmount).sum();     // 避免 in
 ## 4. Optional 与空值处理
 
 ### 4.1 核心原理
+`Optional` 可以理解为一个“明确写出来的结果盒子”：盒子里可能有值，也可能明确为空。它的价值不是让空值消失，而是迫使调用者考虑“没有值怎么办”。
+
+```java
+Optional<User> user = userRepository.findById(id);
+
+String name = user
+        .map(User::getName)
+        .orElse("anonymous");
+```
+
+这段代码可以读成：
+
+```text
+查找用户
+→ 找到：取出 name
+→ 没找到：使用 anonymous
+```
+
+适合用 Optional 表达“查询可能没有结果”，不建议把它用于实体字段、方法参数或所有局部变量。集合查询没有结果时，通常返回空集合比返回 `Optional<List<T>>` 更自然。
+
 `Optional<T>` 是"可能没有值"的容器，**定位为方法返回值**（官方不建议做字段或参数）。
 
 | 方法 | 说明 |
@@ -164,6 +435,22 @@ User v = opt.orElseGet(() -> repo.findDefault()); // 只有为空才查库
 ## 5. 新日期时间 API
 
 ### 5.1 核心原理
+旧日期 API 的问题可以先记成一句话：
+
+```text
+Date/Calendar 可变、时区语义混杂、SimpleDateFormat 线程不安全。
+```
+
+`java.time` 把“日期”“时间”“时区”“时间间隔”拆成不同类型：
+
+```text
+LocalDate       2026-11-12        只有日期
+LocalTime       09:30             只有时间
+LocalDateTime   2026-11-12 09:30  没有时区
+Instant         UTC 时间点         机器之间传递
+ZonedDateTime   带时区的时间        展示和转换
+```
+
 | 类型 | 含义 | 线程安全 |
 | --- | --- | --- |
 | `LocalDate`/`LocalTime`/`LocalDateTime` | 无时区的日期/时间 | 不可变、安全 |
@@ -200,6 +487,14 @@ LocalDateTime next = now.plusDays(7).withHour(0).withMinute(0).withSecond(0).wit
 ## 6. Java 8 其他关键变化
 
 ### 6.1 核心原理
+Java 8 的核心变化可以用三条线记忆：
+
+```text
+写法：Lambda + Stream
+接口：default 方法，让接口可以继续演进
+运行时：元空间、ConcurrentHashMap、CompletableFuture 等工程能力增强
+```
+
 | 变化 | 说明 |
 | --- | --- |
 | 接口 `default`/`static` 方法 | 支持接口演进不破坏实现类；菱形冲突需显式 `A.super.m()` |
@@ -230,6 +525,14 @@ LocalDateTime next = now.plusDays(7).withHour(0).withMinute(0).withSecond(0).wit
 ## 7. Java 9-11
 
 ### 7.1 核心原理
+JDK 9 到 11 可以按“模块、工具、字符串、网络”理解：
+
+```text
+JDK 9：模块化、集合工厂、统一日志、Stream/Optional 增强
+JDK 10：var，减少局部变量类型重复
+JDK 11：LTS、HttpClient、字符串/文件 API、单文件运行
+```
+
 **Java 9**：① **模块化 JPMS**（`module-info.java` 的 `requires/exports/opens`，价值在强封装、`jlink` 裁剪运行时、更小镜像）；② **集合工厂方法** `List.of`/`Set.of`/`Map.of`（不可变、禁 null，见 [集合框架](./02-集合框架.md)）；③ **接口私有方法**（JEP 213）；④ Stream 增强（`takeWhile`/`dropWhile`/`ofNullable`/三参 `iterate`）；⑤ `Optional` 增强（`ifPresentOrElse`/`or`/`stream`）；⑥ `ProcessHandle` API；⑦ **G1 成为默认 GC**（JEP 248）、CMS 标记废弃（JEP 291）；⑧ **统一 JVM 日志** `-Xlog`（JEP 158）；⑨ 多版本 JAR（`META-INF/versions/9/`）；⑩ JShell。
 
 **Java 10**：① **`var` 局部变量类型推断**（JEP 286）；② `Collectors.toUnmodifiableList/Set/Map`、`List.copyOf`/`Set.copyOf`/`Map.copyOf`；③ G1 Full GC 并行化（JEP 307）；④ 应用类数据共享 AppCDS（JEP 310）加速启动。
@@ -269,6 +572,16 @@ c.sendAsync(req, HttpResponse.BodyHandlers.ofString()).thenApply(HttpResponse::b
 ## 8. Java 12-17
 
 ### 8.1 核心原理
+JDK 12 到 17 的主线是“让代码更像业务模型，同时减少样板代码”：
+
+```text
+switch 表达式：分支可以直接产生值
+文本块：多行文本不再堆转义符
+record：用很少代码表达数据载体
+sealed：限制谁可以继承
+模式匹配：判断类型时同时完成转换
+```
+
 | 特性 | 版本 | 要点 |
 | --- | --- | --- |
 | Switch 表达式（JEP 361） | 12 预览 / **14 正式** | `->` 语法、`yield` 返回值、**不贯穿**、需覆盖所有分支或有 default |
@@ -313,6 +626,15 @@ if (shape instanceof Circle c) return Math.PI * c.r() * c.r();
 ## 9. Java 18-21
 
 ### 9.1 核心原理
+JDK 18 到 21 的重点可以这样理解：
+
+```text
+JDK 18：默认 UTF-8，减少平台差异
+JDK 21：让并发、模式匹配和有序集合更好用
+```
+
+虚拟线程解决的是“线程创建和阻塞等待太贵”，不是让 CPU 变多；模式匹配解决的是“先判断类型、再强转、再取字段”的样板代码。
+
 | 特性 | 状态 | 要点 |
 | --- | --- | --- |
 | UTF-8 为默认字符集（JEP 400） | JDK 18 | 依赖平台默认编码（GBK）的代码会乱码 |
@@ -357,6 +679,20 @@ String desc = switch (obj) {
 ## 10. 版本升级实践与面试答法
 
 ### 10.1 核心原理
+升级 JDK 不是只改一个 `java.version`，而是把“编译器、运行时、依赖、启动参数、行为”一起验证：
+
+```text
+依赖是否支持新 JDK
+    ↓
+代码能否编译
+    ↓
+JVM 参数是否仍有效
+    ↓
+反射/字符集/GC 行为是否变化
+    ↓
+测试、压测、灰度和回滚
+```
+
 **升级路线**：① 评估依赖支持（Spring Boot 3 需 JDK 17+；Lombok/ASM/CGLIB/字节码增强类需新版，用 `jdeps --jdk-internals` 扫描内部 API）；② 升级编译目标并修编译错误（`javax.*` → `jakarta.*` 是最大工作量）；③ 替换已移除的启动参数；④ 补 `--add-opens`/`--add-exports`；⑤ GC 与性能复测（G1 默认、`MaxRAMPercentage`）；⑥ 回归测试（序列化兼容、日期时区、字符集、并发行为）；⑦ 灰度发布并保留回滚包。
 
 **常见踩坑清单**：
