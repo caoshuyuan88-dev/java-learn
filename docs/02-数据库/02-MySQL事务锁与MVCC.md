@@ -1,500 +1,563 @@
 # MySQL事务锁与MVCC
 
-> **定位**：讲透 ACID 的实现机制、MVCC 可见性判断与 InnoDB 加锁规则，回答"为什么幻读、到底锁了什么、为什么死锁、为什么主从延迟"这类必考题。
-> **重要度**：★★★★★（面试出现频率）
+> **定位**：理解事务隔离、MVCC、InnoDB 加锁，以及这些机制在复制和备份中的作用。
+> **重要度**：★★★★★
 > **建议复习时长**：6 小时
-> **关联文档**：[./01-MySQL体系结构与索引.md](./01-MySQL体系结构与索引.md)、[./03-MySQL调优主从与分库分表.md](./03-MySQL调优主从与分库分表.md)、[../05-分布式与架构/02-分布式事务.md](../05-分布式与架构/02-分布式事务.md)
+> **关联文档**：[MySQL体系结构与索引](./01-MySQL体系结构与索引.md)、[MySQL调优主从与分库分表](./03-MySQL调优主从与分库分表.md)、[分布式事务](../05-分布式与架构/02-分布式事务.md)
+
+本文以 **MySQL 8.0、InnoDB、默认 REPEATABLE READ（RR）** 为主要讨论对象，特别说明时才涉及 5.7 或其他隔离级别。具体加锁范围、复制参数和命令会随版本、配置和执行计划变化，应以实际环境和对应版本手册为准。
+
+> **实验约定**：SQL 分别在两个独立连接 A、B 中执行；按表格或注释顺序执行，不能把两个会话的语句当成一个脚本运行。实验结束后提交或回滚，避免留下锁。所有示例请在测试库运行。
 
 ## 0. 知识地图
 
-| 知识点 | 重要度 | 常考形式 |
-| --- | --- | --- |
-| 1 ACID 与隔离级别 | ★★★★★ | 八股原理 |
-| 2 MVCC：隐藏列、版本链与 ReadView | ★★★★★ | 八股原理 / 源码追问 |
-| 3 RC 与 RR 差异、幻读与快照读/当前读 | ★★★★★ | 八股原理 / 场景题 |
-| 4 锁体系总览：全局锁、表锁、MDL、意向锁、AUTO-INC | ★★★★★ | 八股原理 / 故障复盘 |
-| 5 行锁三类型与加锁规则实战 | ★★★★★ | 场景题 / 故障复盘 |
-| 6 死锁、锁等待与长事务治理 | ★★★★★ | 故障复盘 / 调优排查 |
-| 7 binlog 三种格式与选型 | ★★★★☆ | 八股原理 / 场景题 |
-| 8 主从复制原理与 GTID、半同步、并行复制 | ★★★★★ | 八股原理 / 场景题 |
-| 9 主从延迟与读写分离一致性 | ★★★★★ | 场景题 / 故障复盘 |
-| 10 一致性备份与锁相关参数 | ★★★★☆ | 调优排查 / 命令实操 |
+```text
+事务 ACID
+├── 原子性：undo 支持回滚
+├── 持久性：redo + 合适的刷盘策略支持崩溃恢复
+├── 隔离性
+│   ├── 一致性读：ReadView + undo 版本链（MVCC）
+│   └── 加锁读/写：索引记录锁、间隙锁等
+└── 一致性：约束 + 正确的事务与业务逻辑
+
+事务提交 → binlog → 复制到从库 → 从库应用 → 读写分离
+             └── 配合一致性备份 → 时间点恢复
+```
+
+| 章节 | 需要回答的问题 |
+| --- | --- |
+| 1 | ACID 是什么？隔离级别允许哪些并发异常？ |
+| 2～3 | 旧版本从哪里来？RC 和 RR 为什么读到不同结果？ |
+| 4～5 | 事务锁住了什么？为什么一个 DDL 或 INSERT 会等待？ |
+| 6 | 如何区分、排查和处理死锁、锁等待与长事务？ |
+| 7～9 | binlog 如何复制？为什么从库可能读不到刚写入的数据？ |
+| 10 | 怎样获得一致的备份，并利用 binlog 恢复？ |
 
 ## 1. ACID 与隔离级别
 
-### 1.1 核心原理
+### 1.1 事务是什么
 
-ACID 与实现机制的对应：**原子性**靠 undo log（记录反向操作，回滚时逆序执行）；**持久性**靠 redo log（WAL，`innodb_flush_log_at_trx_commit` 控制刷盘）；**隔离性**靠 MVCC（读）+ 锁（写），隔离级别决定 ReadView 生成时机与是否加间隙锁；**一致性**是目的而非手段，由 A/I/D 加上业务约束（唯一键、外键、CHECK）共同保证，没有独立实现机制。
-
-| 隔离级别 | 脏读 | 不可重复读 | 幻读 | 说明 |
-| --- | --- | --- | --- | --- |
-| READ UNCOMMITTED | ✗ | ✗ | ✗ | 能读未提交数据，几乎不用 |
-| READ COMMITTED | ✓ | ✗ | ✗ | Oracle/PG 默认；每次 SELECT 新建 ReadView |
-| **REPEATABLE READ** | ✓ | ✓ | ✓（InnoDB 基本避免） | **MySQL 默认**；快照读 + 间隙锁 |
-| SERIALIZABLE | ✓ | ✓ | ✓ | 普通 SELECT 隐式加共享锁，完全串行 |
-
-SQL 标准中 RR **允许**幻读，只有 SERIALIZABLE 才禁止；InnoDB 的 RR 靠"快照读用 MVCC + 当前读用 Next-Key Lock"在绝大多数场景消除幻读。
-
-### 1.2 面试问答
-
-- **Q1：ACID 分别靠什么实现？** 原子性靠 undo log，持久性靠 redo log，隔离性靠 MVCC + 锁；一致性是前三者共同作用的结果加业务约束。
-- **Q2：MySQL 默认隔离级别是什么、为什么？** RR（变量 `transaction_isolation`，5.7 中名为 `tx_isolation`）。历史原因是 RR 在 STATEMENT 格式 binlog 下更安全；如今 binlog 默认 ROW，很多互联网公司主动改 RC 以降低间隙锁带来的冲突。
-- **Q3：RC 与 RR 的核心差别？** 两点：① ReadView 生成时机（RC 每次 SELECT 新建，RR 事务首次 SELECT 建一次后复用）；② RR 会加间隙锁/临键锁，RC 基本只加记录锁，锁范围更小、并发更高。
-- **Q4：不可重复读与幻读的区别？** 不可重复读针对**同一行被 UPDATE**，幻读针对**结果集行数变化（INSERT/DELETE）**，二者的加锁策略（记录锁 vs 间隙锁）也完全不同。
-
-### 1.3 高频追问与陷阱
-
-- 陷阱：认为 RR 完全解决幻读——准确说法是"快照读由 MVCC 避免、当前读由间隙锁避免"，两者混用时仍可能观察到幻读；另外 SERIALIZABLE 下读读不互斥、读写互斥，等价于串行执行。
-
-### 1.4 代码/配置/命令示例
+事务把多条操作组成一个逻辑单元：成功时 `COMMIT`，需要放弃时 `ROLLBACK`。例如转账需要同时扣减 A 和增加 B；只完成一半不符合业务要求。
 
 ```sql
-SELECT @@transaction_isolation;              -- 8.0；5.7 为 SELECT @@tx_isolation;
-SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
-SET GLOBAL transaction_isolation='REPEATABLE-READ';
-SHOW VARIABLES LIKE 'binlog_format';
+START TRANSACTION;
+UPDATE account SET balance = balance - 100 WHERE id = 1;
+UPDATE account SET balance = balance + 100 WHERE id = 2;
+COMMIT;  -- 发生错误时应由应用执行 ROLLBACK
 ```
 
-### 1.5 一句话速记
+这只是演示事务边界：实际转账还需校验账户存在、余额足够、更新行数及请求幂等。MySQL 默认 `autocommit=1`，没有显式开启事务时，一条成功的 DML 通常就是一个独立事务；有些 DDL 会隐式提交，不能简单地和普通 DML 一起回滚。
 
-**原子性=undo、持久性=redo、隔离性=MVCC+锁；默认 RR，互联网常改 RC 以减少间隙锁冲突。**
+### 1.2 ACID 与实现
+
+| 特性 | 含义 | InnoDB 的相关机制与边界 |
+| --- | --- | --- |
+| Atomicity 原子性 | 一个事务的修改整体提交或整体撤销 | undo 记录支持回滚；崩溃恢复也依赖日志和事务状态，不是只靠应用执行反向 SQL |
+| Consistency 一致性 | 事务执行前后，数据满足业务与数据库约束 | 唯一键、外键、CHECK、正确的业务逻辑与其他 ACID 特性共同作用；数据库不能自动发现所有业务规则 |
+| Isolation 隔离性 | 并发事务之间按约定的隔离级别观察数据 | 一致性读使用 MVCC；加锁读和写操作使用锁；具体行为受隔离级别影响 |
+| Durability 持久性 | 已确认提交的数据在故障后仍可恢复 | redo 和 WAL（先写日志再刷数据页）用于崩溃恢复；实际保障还依赖刷盘配置、存储和故障范围 |
+
+`innodb_flush_log_at_trx_commit=1` 通常表示每次提交将 redo 写入并刷到持久存储；其他值可以提高吞吐，但故障时可能丢失已确认事务。启用 binlog 时也要考虑 `sync_binlog`、存储可靠性及备份，不能把 redo 和 binlog 混为一谈：前者服务于 InnoDB 崩溃恢复，后者用于复制和基于日志的恢复。
+
+### 1.3 并发异常与隔离级别
+
+- **脏读**：事务 A 读到了事务 B 尚未提交的数据，B 随后可能回滚。
+- **不可重复读**：A 两次读同一行，B 在两次读取之间修改并提交，A 读到不同值。
+- **幻读**：A 两次按同一条件查询，B 在中间插入或删除符合条件的行，结果集发生变化。它侧重的是**符合条件的记录集合**；与不可重复读在广义描述上可能重叠。
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 | InnoDB 中的典型行为 |
+| --- | --- | --- | --- | --- |
+| READ UNCOMMITTED（RU） | 可能 | 可能 | 可能 | 可以读到其他事务尚未提交的修改 |
+| READ COMMITTED（RC） | 不允许 | 可能 | 可能 | 每次一致性读创建新视图；通常不使用间隙锁 |
+| REPEATABLE READ（RR） | 不允许 | 不允许 | SQL 标准允许 | 普通一致性读复用视图；加锁范围查询通常使用临键锁 |
+| SERIALIZABLE | 不允许 | 不允许 | 不允许 | 使用更强隔离；显式事务中的普通 SELECT 通常转为共享加锁读 |
+
+这里“允许/不允许”描述隔离保证，并不意味着每次并发都会发生异常。SERIALIZABLE 并不是所有事务逐个排队运行：兼容的读仍可并发；是否将普通 SELECT 转成加锁读还与事务及 `autocommit` 状态有关。RR 的快照读和加锁读混用有特殊现象，见第 3 节。
+
+```sql
+SELECT VERSION(), @@transaction_isolation, @@autocommit;
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+-- 仅影响之后启动的事务；已有事务不应依赖这个设置即时改变隔离级别
+```
+
+MySQL 5.7 的变量名与小版本有关，部分环境使用 `tx_isolation`；请用 `SHOW VARIABLES LIKE '%isolation%';` 核对。选择 RC 可能减少间隙锁冲突，但不能因此忽略业务对重复读、范围保护和复制格式的要求。
 
 ## 2. MVCC：隐藏列、版本链与 ReadView
 
-### 2.1 核心原理
+### 2.1 版本链解决什么问题
 
-每行有两个隐藏列：`DB_TRX_ID`（6 字节，最后修改该行的事务 ID）、`DB_ROLL_PTR`（7 字节，指向 undo log 中的旧版本）；`DB_ROW_ID`（6 字节）仅在无主键且无唯一非空索引时生成。**版本链**：每次更新把旧值写入 undo log 并用 `DB_ROLL_PTR` 串成链表，链表头为最新版本；purge 线程在确认无 ReadView 需要旧版本后清理。
+MVCC（多版本并发控制）让**一致性读**根据事务视图读取合适的行版本：读者一般不必等待写者提交，也不阻止写者更新。它不消除写写冲突；更新同一行仍需要互相等待。
 
-ReadView 四个字段：`m_ids`（生成瞬间**活跃未提交**事务 ID 列表）、`min_trx_id`（`m_ids` 最小值）、`max_trx_id`（**下一个待分配**的事务 ID）、`creator_trx_id`（创建本 ReadView 的事务 ID）。
+InnoDB 聚簇索引记录包含 `DB_TRX_ID`（6 字节，最近修改该记录的事务 ID）和 `DB_ROLL_PTR`（7 字节，指向相关 undo 记录）。没有合适的显式主键或非空唯一键时，InnoDB 会生成隐藏的 `DB_ROW_ID`。不要把 undo 简化成一组一定会被执行的反向 SQL：它记录的是供回滚及构造旧版本使用的信息。
 
-**可见性判断算法**（对版本链上某版本的 `trx_id`）：
+例如一行从 100 被先后更新为 120、150，示意如下：
 
-1. `trx_id == creator_trx_id` → **可见**（自己改的）。
-2. `trx_id < min_trx_id` → **可见**（在 ReadView 生成前已提交）。
-3. `trx_id >= max_trx_id` → **不可见**（在 ReadView 生成后才开启）。
-4. `min_trx_id <= trx_id < max_trx_id`：在 `m_ids` 中 → **不可见**（仍活跃）；否则 → **可见**（已提交）。
-
-不可见则沿 `DB_ROLL_PTR` 取下一个版本重新判断，直到链表尾（全部不可见则本行对该事务"不存在"）。
-
-### 2.2 面试问答
-
-- **Q1：MVCC 是什么、解决什么问题？** 多版本并发控制：读不阻塞写、写不阻塞读，通过 ReadView 判断该读哪个历史版本，实现"无锁读"。它**只作用于快照读**，当前读仍走锁。
-- **Q2：ReadView 四个字段分别做什么？** `m_ids` 记录生成瞬间的活跃事务；`min_trx_id`/`max_trx_id` 划定"一定可见"与"一定不可见"的边界；`creator_trx_id` 用于识别自己产生的新版本（自己总能看见自己的修改）。
-- **Q3：为什么版本链会越来越长？** 只要有长事务持有旧 ReadView，purge 就不敢清理它还需要的历史版本，undo 页持续增长；监控 `Innodb_history_list_length` 即可发现。
-- **Q4：三种 DML 的 undo 分别是什么？RC 下为什么不可重复读？** INSERT 的 undo 是 DELETE，UPDATE 的 undo 是反向 UPDATE（记旧值），DELETE 的 undo 是 INSERT（按主键插回）；RC 下每次 SELECT 都新建 ReadView，第二次查询时前一阶段提交的事务已不在 `m_ids` 里，其新版本随即变为可见。
-
-### 2.3 高频追问与陷阱
-
-- 陷阱：以为 MVCC 等于"不加锁"——当前读（`FOR UPDATE`、`LOCK IN SHARE MODE`、`UPDATE`、`DELETE`）读的永远是最新版本并加锁，MVCC 只覆盖普通 `SELECT`；另外 `max_trx_id` 是**下一个待分配的事务 ID**，不是"最大的活跃事务 ID"。
-
-### 2.4 代码/配置/命令示例
-
-```sql
-SHOW ENGINE INNODB STATUS\G                -- 看 History list length
-SELECT trx_id,trx_mysql_thread_id,trx_state,trx_started,trx_rows_locked,trx_rows_modified
-FROM information_schema.INNODB_TRX ORDER BY trx_started;
-SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME='trx_rseg_history_len';
+```text
+聚簇索引中的当前版本
+  balance=150, trx_id=30
+       │ DB_ROLL_PTR
+       ▼
+  undo：可重建 balance=120, trx_id=20
+       │
+       ▼
+  undo：可重建 balance=100, trx_id=10
 ```
 
-### 2.5 一句话速记
+查询先判断当前版本对自己的 ReadView 是否可见；不可见则沿 undo 重建并判断更早的版本，直到找到可见版本或确认记录对该视图不存在。删除也需要保留供旧视图使用的信息；不应把它理解为立即物理删除所有版本。
 
-**隐藏列 DB_TRX_ID/DB_ROLL_PTR 串出 undo 版本链，ReadView 用 m_ids/min/max/creator 四字段判定可见性；MVCC 只管快照读。**
+**例子：两个事务如何通过版本链读取同一行**
 
-## 3. RC 与 RR 差异、幻读与快照读/当前读
+假设余额最初为 100，最后修改该行的事务 ID 为 10；事务 A 的 ID 为 20。以下 ID 仅用于说明：
 
-### 3.1 核心原理
+1. A 将余额改为 200，但尚未提交。当前行标记为事务 20，旧版本可通过 undo 重建：
 
-| 对比项 | READ COMMITTED | REPEATABLE READ |
-| --- | --- | --- |
-| ReadView 生成时机 | **每次 SELECT 都新建** | **事务内首次 SELECT 时建一次，之后复用** |
-| 能否重复读同一版本 / 间隙锁 | 不能；基本不加间隙锁（仅外键、唯一冲突检查等少数场景） | 能；**加 Gap/Next-Key Lock**，锁冲突与死锁概率更高 |
-| binlog 兼容（历史原因） | 需 ROW | STATEMENT 也安全 |
+   ```text
+   当前行：余额 200，事务 ID = 20
+                  │ DB_ROLL_PTR
+                  ▼
+   undo：可重建余额 100，事务 ID = 10
+   ```
 
-**快照读 vs 当前读**：普通 `SELECT` 是快照读，读 ReadView 对应的历史版本、**不加锁**；`SELECT ... FOR UPDATE`、`LOCK IN SHARE MODE`（8.0 新语法 `FOR SHARE`）、`UPDATE`、`DELETE`、`INSERT` 是当前读，读**最新已提交版本并加锁**。
+2. 事务 B 第一次执行普通 `SELECT`，创建 ReadView。因为事务 20 此时仍活跃，当前版本对 B 不可见；B 沿 undo 找到事务 10 的旧版本，返回 **100**。
+3. A 提交后，B 再次执行普通 `SELECT`：在 RR 下，B 复用旧 ReadView，仍返回 **100**；在 RC 下，B 创建新 ReadView，此时 A 已提交，返回 **200**。
 
-**RR 下幻读是否被解决，分三种情况**：① 全程快照读 → 不会幻读（同一快照）；② 全程当前读 → 不会幻读（Next-Key Lock 锁住间隙阻止插入）；③ **先快照读、后当前读** → 仍可能幻读：
+简言之：**事务 ID 标记版本由谁修改，ReadView 判断版本是否可见，undo 帮助重建不可见时需要的旧版本**。若 B 自己执行 `UPDATE`，则要处理当前记录并获取锁，而不是只修改快照中的旧版本。
 
-```sql
-BEGIN;
-SELECT * FROM t WHERE id=5;            -- 快照读：无此行，不加锁
-UPDATE t SET c=1 WHERE id=5;           -- 当前读：若别的事务已插入 id=5，此处会读到并加锁
-SELECT * FROM t WHERE id=5;            -- 快照读：仍读旧快照 → 与 UPDATE 的结果不一致
-COMMIT;
-```
+### 2.2 ReadView 如何判断可见性
 
-### 3.2 面试问答
+以下字段名称是常见的源码/教学表述，不是 SQL 可查询的公共接口；不同版本细节可能不同：
 
-- **Q1：为什么 RR 能"可重复读"？** 整个事务复用同一个 ReadView，期间其他事务提交的版本不在该 ReadView 的可见集合里，因此一直读到同一份快照。
-- **Q2：RR 到底解决了幻读没有？** **快照读由 MVCC 避免，当前读由 Next-Key Lock 避免，但两者混用时（先快照读后当前读）仍可能观察到幻读**。所以严格说 InnoDB 的 RR 没有 100% 杜绝幻读。
-- **Q3：间隙锁在这里起什么作用？** 锁住一个**开区间**，阻止其他事务在该区间内插入新记录，从而阻止当前读场景下"凭空多出几行"。这是 RR 默认开启、RC 基本不用的关键差异。
-- **Q4：`FOR SHARE` 与 `FOR UPDATE` 的区别？** 前者加共享锁（S），多个事务可同时持有、彼此不阻塞，但会被 `FOR UPDATE` 的排他锁（X）阻塞；8.0 用 `FOR SHARE` 取代旧的 `LOCK IN SHARE MODE`（旧语法仍可用）。另外未提交事务的修改一定不可见——其 ID 必然在 ReadView 的 `m_ids` 中，于是沿版本链读更旧的版本，这就是避免脏读的机制。
-
-### 3.3 高频追问与陷阱
-
-- 陷阱：认为 RR 事务里所有读都一致。当前读永远读最新版本，"事务内数据不一致"在 RR 下同样可能发生；而 `START TRANSACTION WITH CONSISTENT SNAPSHOT` 可在 `BEGIN` 时立即建立一致性快照（RR 专用），`mysqldump --single-transaction` 的一致性就依赖这个语义。
-
-### 3.4 代码/配置/命令示例
-
-```sql
--- 会话 A                           -- 会话 B
-BEGIN;
-                                   BEGIN;
-SELECT * FROM t WHERE id=5;        -- 空
-                                   INSERT INTO t(id,c) VALUES(5,1); COMMIT;
-SELECT * FROM t WHERE id=5;        -- RR 下仍为空（快照读）
-SELECT * FROM t WHERE id=5 FOR UPDATE;   -- 当前读，能看到 id=5
-COMMIT;
-```
-
-### 3.5 一句话速记
-
-**RC 每次 SELECT 新建 ReadView、几乎不加间隙锁；RR 事务首次 SELECT 建一次并复用 + Next-Key Lock；快照读走 MVCC、当前读走锁。**
-
-## 4. 锁体系总览：全局锁、表锁、MDL、意向锁、AUTO-INC
-
-### 4.1 核心原理
-
-| 层级 | 锁 | 加锁方式 | 要点 |
-| --- | --- | --- | --- |
-| 全局 | 全局读锁 | `FLUSH TABLES WITH READ LOCK`（FTWRL） | 全库只读，备份/切换用；InnoDB 备份改用 `--single-transaction` 避免 |
-| 全局 | 全局写锁 | `SET GLOBAL read_only=ON` | 普通账号只读，对持有 SUPER 的账号无效 |
-| 表级 | 表读/写锁 | `LOCK TABLES t READ/WRITE` | InnoDB 可用但严重限制并发，且会隐式提交当前事务 |
-| 表级 | **MDL 元数据锁** | 自动加 | DML 加读锁、DDL 加写锁；**长事务 + DDL 的经典卡库来源** |
-| 表级 | **意向锁 IS/IX** | 自动加 | 表级标志位表示"表中已有行锁"，**意向锁之间不冲突**，只与表锁冲突 |
-| 行级 | `AUTO-INC` 锁 | 自动加 | 自增列分配用，粒度由 `innodb_autoinc_lock_mode` 决定 |
-
-**MDL 经典死锁场景**：事务 A 持有表 t 的 MDL 读锁（普通 SELECT 后未提交）→ 事务 B 请求 MDL 写锁（`ALTER TABLE`）被阻塞 → 事务 C 请求 MDL 读锁，因**写锁优先级更高**也要排队 → 之后所有访问该表的请求全部堵死，表现为"数据库整体卡住"。规避：DDL 前先清理长事务，并显式调小 `lock_wait_timeout`（默认 31536000 秒 ≈ 1 年）。
-
-**AUTO-INC 锁模式**：0 = traditional（语句级表锁，保证连续）；1 = consecutive（简单插入用轻量互斥量，批量插入仍用表锁，**5.7 默认**）；2 = interleaved（不保证自增值连续、并发最高，**8.0 默认**）。mode=2 在 `binlog_format=ROW` 下安全，若用 STATEMENT 会导致主从自增值不一致。
-
-### 4.2 面试问答
-
-- **Q1：意向锁有什么用？** 它是表级锁，表示"表里存在行锁"。没有它，事务想加表锁就得逐行扫描判断；有 IS/IX 只需检查表上的意向锁。**意向锁之间互不冲突**，IX 与表级 S 冲突、IS/IX 与表级 X 冲突。
-- **Q2：MDL 什么时候加、什么时候释放？** 每条 DML 自动加 MDL 读锁、DDL 自动加 MDL 写锁；释放时机是**事务结束**而非语句结束。所以"开了事务没提交 + 另一会话执行 DDL"就是灾难现场。
-- **Q3：为什么 `FLUSH TABLES WITH READ LOCK` 危险？** 它阻塞所有写操作。InnoDB 做一致性备份完全可以用 `mysqldump --single-transaction`（靠 MVCC 快照），无需全局锁；用 FTWRL 还容易因客户端断连忘记解锁。
-- **Q4：`innodb_autoinc_lock_mode=2` 会导致主从不一致吗？MDL 等待怎么排查？** 只在 `binlog_format=STATEMENT` 时可能（自增值间隔不同）；ROW 格式记录实际行镜像，不依赖自增值连续性，因此安全，这也是 8.0 敢改默认值的前提。MDL 排查：`SHOW PROCESSLIST` 出现 `Waiting for table metadata lock` 即关键信号，8.0 查 `performance_schema.metadata_locks WHERE LOCK_STATUS='PENDING'` 或 `sys.schema_table_lock_waits`。
-
-### 4.3 高频追问与陷阱
-
-- 陷阱：以为 MDL 读锁之间会冲突——多个读锁可共存，问题在于写锁会插队并阻塞后续读锁；另外 `lock_wait_timeout` 默认 31536000 秒，DDL 遇到长事务会长时间挂住而不报错，必须显式调小。
-
-### 4.4 代码/配置/命令示例
-
-```sql
-SELECT * FROM performance_schema.metadata_locks WHERE LOCK_STATUS='PENDING';
-SELECT * FROM sys.schema_table_lock_waits;
-SHOW VARIABLES LIKE 'lock_wait_timeout';
-SHOW VARIABLES LIKE 'innodb_autoinc_lock_mode';
-SET SESSION lock_wait_timeout = 30;   -- DDL 会话设合理上限
-```
-
-### 4.5 一句话速记
-
-**全局锁慎用（InnoDB 备份走 MVCC 快照）；MDL 事务结束才释放、是 DDL 卡库元凶；意向锁是表级标志位不与行锁冲突；AUTO-INC 默认 8.0=2、5.7=1。**
-
-## 5. 行锁三类型与加锁规则实战
-
-### 5.1 核心原理
-
-| 行锁类型 | 锁什么 | 何时使用 |
-| --- | --- | --- |
-| **Record Lock**（记录锁） | 单个索引记录 | 唯一索引等值**命中** |
-| **Gap Lock**（间隙锁） | 开区间 `(a, b)`，不含两端记录 | 唯一索引等值**未命中**、RR 下插入前的间隙保护 |
-| **Next-Key Lock**（临键锁） | 记录 + 前面的间隙，即左开右闭 `(a, b]` | 非唯一索引等值、范围查询（RR 默认） |
-
-**插入意向锁**：一种特殊的**间隙锁**，插入前由插入事务设置，表示"我打算在这个间隙的这个位置插入"。**同一间隙的不同位置插入互不阻塞**（与普通间隙锁的关键区别），但要等该间隙上已有的间隙锁释放。
-
-| # | 场景（RR，`FOR UPDATE`） | 锁了什么 |
-| --- | --- | --- |
-| 1 | 唯一索引等值**命中** `WHERE id=5` / **未命中**（无此行） | 命中：**Record Lock** on id=5（Next-Key 退化为记录锁）；未命中：**Gap Lock** `(上一个值, 下一个值)` |
-| 2 | 非唯一索引等值 `WHERE a=5`（a 非唯一）：命中 / 未命中 | 命中：该记录的 **Next-Key Lock** + 对应行在**主键索引**上也加锁；未命中：Gap Lock |
-| 3 | 范围查询：唯一索引 `id>5 AND id<=10` / 非唯一索引 `a>5 AND a<=10` | `(5, 10]` 上的 Next-Key Lock；非唯一索引还会多锁到下一个不满足条件的记录 |
-| 4 | **无索引列** `WHERE c=5`（c 无索引） | **锁全表所有记录**（每条记录及其间隙都加 Next-Key Lock），等于锁表 |
-| 5 | `LIMIT` 语句 `WHERE a>5 LIMIT 2` / `FOR SHARE`（8.0） | LIMIT 只锁扫描到的行；`FOR SHARE` 加共享 Next-Key Lock，**8.0 起对不匹配的行会释放锁**（5.7 不释放） |
-| 6 | `INSERT` 撞上已有 Gap Lock | 被阻塞，等间隙锁释放（这是"无索引锁全表"导致插入排队的根因） |
-
-**核心结论：行锁是加在"索引"上的，不是加在"行"上的。** 所以 `WHERE c=5`（无索引）会全表扫描并给每条记录加临键锁——这就是"没索引会锁全表"的根因，也是必须给 WHERE 列建索引的隐藏理由。
-
-### 5.2 面试问答
-
-- **Q1：为什么 `WHERE 无索引列 FOR UPDATE` 会锁全表？** 行锁加在索引记录上，无索引只能全表扫描，扫描路径上每条记录（及其间隙）都被加 Next-Key Lock，效果等同锁表；并发的 INSERT 会因插入意向锁与间隙锁冲突而排队。
-- **Q2：唯一索引等值"命中"与"未命中"为什么加的锁不同？** 命中时唯一性保证最多一行，Next-Key Lock 退化为 Record Lock（无需锁间隙）；未命中时没有记录可锁，只能锁住这个"不存在的值"所在的间隙，防止其他事务插进来。
-- **Q3：非唯一索引等值为什么要锁主键索引？** 查询可能要回表，为保证回表读到一致的行、也让 UPDATE 正确执行，InnoDB 在命中记录对应的主键索引项上也加锁（此处是 Record Lock）。
-- **Q4：间隙锁之间会冲突吗？** **不会**。两个事务可在同一间隙上同时持有间隙锁（意图都是"防插入"），它们只与插入意向锁冲突——这解释了"间隙锁彼此相容但插入仍被阻塞"。RC 下不加间隙锁（少数场景除外），只有 Record Lock，且不满足条件的行上的锁会释放（semi-consistent read），并发度更高。
-
-### 5.3 高频追问与陷阱
-
-- 陷阱：以为"锁加在行上"。同一查询走不同索引，加锁范围完全不同——这是优化锁冲突最容易被忽视的杠杆。
-- 陷阱：`FOR UPDATE` 的锁会持有到事务提交；把它放进长事务里必然造成大面积锁等待。
-
-### 5.4 代码/配置/命令示例
-
-```sql
-BEGIN;
-SELECT * FROM t WHERE c=1 FOR UPDATE;   -- c 无索引 → 全表记录被加临键锁，并发 INSERT/UPDATE 阻塞
-SELECT ENGINE_TRANSACTION_ID,OBJECT_NAME,INDEX_NAME,LOCK_TYPE,LOCK_MODE,LOCK_DATA
-FROM performance_schema.data_locks;     -- 8.0 观察当前锁
-```
-
-### 5.5 一句话速记
-
-**行锁=记录锁/间隙锁/临键锁且加在索引上：唯一等值命中=记录锁、未命中=间隙锁、非唯一等值=临键锁、无索引=锁全表。**
-
-## 6. 死锁、锁等待与长事务治理
-
-### 6.1 核心原理
-
-**死锁成因**：两个及以上事务形成循环等待。典型模式：事务 A 持 `id=1` 的 X 锁、事务 B 持 `id=2` 的 X 锁，随后 A 去锁 `id=2`、B 去锁 `id=1`，双方互等。其他成因：不同索引顺序加锁、唯一键冲突加间隙锁、批量插入顺序不一致、事务粒度过大。
-
-**InnoDB 处理**：`innodb_deadlock_detect` 默认 ON，用**等待图**主动检测环路，发现后回滚**代价最小**（通常修改行数最少）的事务并返回 `Deadlock found ... try restarting transaction`；关闭检测则只能靠 `innodb_lock_wait_timeout`（默认 **50 秒**）超时兜底，生产不建议关闭。注意区分：**锁等待超时是单向等待、无环路**，报错为 `Lock wait timeout exceeded`。
-
-**`SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK` 读法**：
-
-| 片段 | 含义 |
+| 字段 | 含义 |
 | --- | --- |
-| `*** (1) TRANSACTION:` | 参与死锁的事务 1 |
-| `TRANSACTION ... ACTIVE 5 sec` / `LOCK WAIT 3 lock struct(s)` | 活跃/等待时长（长事务信号）、当前在等锁且持有 3 个锁结构 |
-| `MySQL thread id 12, query id 345 ... updating` | 会话线程 ID（可 `kill`） |
-| `RECORD LOCKS ... index PRIMARY` / `lock_mode X locks rec but not gap waiting` | **锁在哪个索引上**（定位关键）；`rec but not gap` = 记录锁，含 gap 即临键锁 |
-| `HOLDS THE LOCK(S)` / `WAITING FOR THIS LOCK TO BE GRANTED` / `WE ROLL BACK TRANSACTION (2)` | 对照持有与等待的锁即死锁根因；最后一行是 InnoDB 选择回滚的事务 |
+| `m_ids` | 创建视图时活跃的读写事务 ID 集合 |
+| `min_trx_id` | 活跃事务 ID 的下界；集合非空时是最小活跃 ID |
+| `max_trx_id` | 创建视图时下一待分配事务 ID 的边界，并非最大的活跃 ID |
+| `creator_trx_id` | 创建该视图的事务 ID，用来识别自己的修改 |
 
-**长事务的四重危害**：① purge 不敢清理 undo，`History list length` 持续增长、undo 表空间膨胀；② 行锁与 MDL 长期不释放，阻塞 DML 甚至 DDL（MDL 排队导致整表不可访问）；③ 回滚代价极高（逆序执行大量 undo）；④ 大事务在从库原子重放，造成主从延迟。监控用 `INNODB_TRX` 的 `trx_started`、`trx_rows_locked` 与 `Innodb_history_list_length`；应用侧禁止在事务内做 RPC/HTTP/MQ/循环批处理。
+对候选版本的 `trx_id`，按以下顺序判断：
 
-### 6.2 面试问答
+1. 是创建者自己的修改：可见。
+2. 小于 `min_trx_id`：可见。
+3. 大于或等于 `max_trx_id`：不可见。
+4. 位于两者之间：在 `m_ids` 中则不可见，否则可见。
 
-- **Q1：死锁怎么产生的？** "加锁顺序不一致 + 持有并等待"即可形成循环等待，与隔离级别关系不大，但 RR 因间隙锁范围大而更易发生。
-- **Q2：InnoDB 怎么处理死锁？** 默认开启等待图检测，立刻回滚代价最小的事务；业务侧应**捕获该异常并重试**，而不是让请求失败或崩溃。
-- **Q3：怎么定位死锁？** ① 错误日志或 `SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK`；② `innodb_print_all_deadlocks=ON` 记录全部（默认只记最近一次）；③ 8.0 实时看 `performance_schema.data_locks`/`data_lock_waits`（5.7 的 `information_schema.innodb_locks` 在 8.0 已移除）。
-- **Q4：怎么规避死锁？** 统一加锁顺序（按主键升序批量更新）；缩小事务、尽快提交；建合适索引缩小加锁范围；拆大事务错峰执行；热点行改乐观锁或排队串行化；必要时降级到 RC 减少间隙锁。
-- **Q5：长事务怎么发现与治理？** `SELECT trx_id,trx_mysql_thread_id,trx_started,TIMESTAMPDIFF(SECOND,trx_started,NOW()) AS sec,trx_rows_locked FROM information_schema.INNODB_TRX ORDER BY trx_started;`——`sec` 大而 `trx_rows_locked` 小通常是应用忘了提交。治理：统一事务边界、设事务超时、禁止事务内远程调用、必要时 `KILL`。
+例如视图创建时 `m_ids=[20, 30]`、`min=20`、`max=40`：事务 10 的版本可见；事务 20 的版本不可见；事务 25 的版本不在活跃集合中，可见；事务 40 的版本不可见。即使事务 20 **之后**提交，对这个已经创建的视图仍不可见。事务 ID 何时分配有实现细节，不应等同于业务调用 `BEGIN` 的时间。
 
-### 6.3 高频追问与陷阱
+### 2.3 旧版本何时清理
 
-- 陷阱：`Sleep` 状态的连接也可能是长事务——它只表示当前没在执行 SQL，判断要看 `INNODB_TRX`；`@Transactional` 的典型陷阱是事务内做远程调用、循环里用 `REQUIRES_NEW`、以及同类内部调用导致注解失效。
-- 陷阱：`innodb_rollback_on_timeout` 默认 OFF，锁等待超时只回滚**当前语句**；而 `KILL` 连接后 InnoDB 还要回滚整个事务，大事务回滚可能耗时很久。
-
-### 6.4 代码/配置/命令示例
+purge 清理不再被任何相关视图需要的历史版本。长时间持有旧 ReadView 会延迟清理，可能增加 undo 空间和查询旧版本的成本。`History list length` 反映待清理的历史工作量趋势，但不是 undo 字节数或长事务数量；需结合负载、持续时间及事务信息分析。
 
 ```sql
-SHOW ENGINE INNODB STATUS\G                        -- LATEST DETECTED DEADLOCK / TRANSACTIONS
-SET GLOBAL innodb_print_all_deadlocks = ON;
-SET GLOBAL innodb_lock_wait_timeout = 10;
-SELECT * FROM sys.innodb_lock_waits;               -- 找 blocking_thread 后 KILL
-SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME='trx_rseg_history_len';
+SHOW ENGINE INNODB STATUS\G
+SELECT trx_id, trx_mysql_thread_id, trx_state, trx_started,
+       trx_rows_locked, trx_rows_modified
+FROM information_schema.INNODB_TRX
+ORDER BY trx_started;
 ```
 
-### 6.5 一句话速记
+## 3. RC 与 RR、快照读和当前读
 
-**死锁=循环等待，InnoDB 用等待图检测并回滚代价最小的事务；靠统一加锁顺序、缩小事务与锁范围规避；长事务用 INNODB_TRX 与 history list length 监控。**
+### 3.1 两种读取方式
 
-## 7. binlog 三种格式与选型
+| | 一致性读（通常称快照读） | 加锁读/写（通常称当前读） |
+| --- | --- | --- |
+| 常见语句 | RC/RR 下普通 `SELECT` | `SELECT ... FOR UPDATE`、`FOR SHARE`、`UPDATE`、`DELETE` |
+| 数据来源 | ReadView 可见版本，并能看到本事务自己的修改 | 处理当前记录；遇到未提交冲突可能等待，等待后再处理 |
+| 数据行锁 | 普通一致性读不加行锁，仍可能持有 MDL | 根据索引扫描和隔离级别加锁 |
 
-### 7.1 核心原理
+`INSERT` 是写操作，会参与唯一性检查并获取相应锁，但不宜简单说它是一个 SELECT 式的“读取”。MySQL 5.7 的共享加锁语法为 `LOCK IN SHARE MODE`，8.0 也支持 `FOR SHARE`。加锁读应放在显式事务中，才能让锁跨语句保护后续操作。
 
-| 格式 | 记录内容 | 优点 | 缺点 |
-| --- | --- | --- | --- |
-| STATEMENT（SBR） | SQL 原文 | 日志小、可读性好 | 不确定性函数（`NOW()`/`RAND()`/`UUID()`、无序 `LIMIT`）导致主从不一致；RC 下更危险 |
-| ROW（RBR） | 每行的前后镜像 | **最安全**，主从一致；支持 CDC 与行级审计/闪回 | 日志量大（批量 UPDATE 可放大数倍到数百倍） |
-| MIXED（MBR） | 默认 SBR，遇到不确定语句切 RBR | 折中 | 判断规则复杂，实践很少使用 |
+RC 的**每次一致性读**建立新视图；RR 通常在事务中**首次一致性读**建立视图并复用。RR 下 `START TRANSACTION WITH CONSISTENT SNAPSHOT` 可提前建立一致性快照；普通 `BEGIN` 本身不一定建立快照。当前读不使用该旧视图。
 
-默认值：MySQL **5.7.7+ 与 8.0 默认 `binlog_format=ROW`**；`binlog_row_image` 默认 `FULL`（可设 `MINIMAL` 减小日志量，但部分 CDC 工具依赖 FULL）。选型结论：**生产一律 ROW**——复制安全 + 支持 CDC（canal/Debezium 订阅 binlog 刷新缓存）+ 支持闪回。代价是日志量大，用 `binlog_expire_logs_seconds`（8.0，默认 2592000 秒 = 30 天）/ `expire_logs_days`（5.7，默认 0 表示不自动删）及时清理并归档到对象存储。
+### 3.2 双会话实验：不可重复读
 
-### 7.2 面试问答
+准备数据：
 
-- **Q1：为什么 STATEMENT 会主从不一致？** 记录的是 SQL，重放时环境可能不同：`NOW()` 时刻不同、`UUID()`/`RAND()` 随机、无序 `LIMIT` 返回行不确定、`AUTO_INCREMENT` 分配不连续。ROW 记录实际行镜像，与重放环境无关。
-- **Q2：ROW 格式日志太大怎么办？** ① `binlog_row_image=MINIMAL` 只记主键与变更列（注意 canal 等工具需 FULL）；② 拆大事务（大事务还导致从库延迟）；③ 合理设置过期时间及时清理；④ 归档到对象存储而非无限保留本地盘。
-- **Q3：binlog 的写入链路？** 事务提交时先写 `binlog cache`（`binlog_cache_size` 默认 32KB，大事务溢出到临时文件），再按**组提交**三阶段 flush → sync → commit 落盘；`sync_binlog` 控制 fsync 频率。`Binlog_cache_disk_use` 持续增长说明缓存太小。
-- **Q4：误删数据怎么恢复？** ROW 格式下用 `binlog2sql`、`myflash` 等工具把 ROW 事件反转成补偿语句（闪回），或用 `mysqlbinlog` 按时间点回放到误操作前。这也是必须选 ROW 的重要原因。
-- **Q5：`binlog_cache_size` 是全局参数吗？** 它是**每个会话/每个事务**的缓存大小，设置过大在几千并发时会显著吃内存；监控 `Binlog_cache_disk_use` 与 `Binlog_cache_use` 的比例来调参。
+```sql
+CREATE TABLE mvcc_demo (
+    id INT PRIMARY KEY,
+    balance INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO mvcc_demo VALUES (1, 100);
+```
 
-### 7.3 高频追问与陷阱
+按顺序执行，下表每行在前一行完成后执行：
 
-- 陷阱：以为 MIXED 能自动规避所有不一致，它只对明确标记"不安全"的语句切 ROW。
-- 陷阱：ROW 格式下 `mysqlbinlog` 直接输出不可读，必须加 `--base64-output=decode-rows -v`。
+| 步骤 | 会话 A：RR | 会话 B |
+| --- | --- | --- |
+| 1 | `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;` | |
+| 2 | `START TRANSACTION;` | |
+| 3 | `SELECT balance FROM mvcc_demo WHERE id=1;` → 100，建立视图 | |
+| 4 | | `UPDATE mvcc_demo SET balance=200 WHERE id=1;`（自动提交） |
+| 5 | `SELECT balance FROM mvcc_demo WHERE id=1;` → 100 | |
+| 6 | `SELECT balance FROM mvcc_demo WHERE id=1 FOR UPDATE;` → 200，并加锁 | |
+| 7 | `COMMIT;` | |
 
-### 7.4 代码/配置/命令示例
+将初始值恢复为 100，再把 A 的隔离级别改为 RC 重做：第 5 步返回 200。上表默认 B 为自动提交，且没有其他并发操作。
+
+### 3.3 RR 下幻读和“看到自己的修改”
+
+RR 中，反复执行普通一致性读，其他事务之后插入的行不会出现在旧视图中；对**实际覆盖范围**执行加锁读后，临键锁通常能阻止其他事务向受保护间隙插入。两者混用时不能认为所有语句看到的数据都相同：
+
+| 步骤 | 会话 A：RR | 会话 B：自动提交 |
+| --- | --- | --- |
+| 1 | `START TRANSACTION;` | |
+| 2 | `SELECT * FROM mvcc_demo WHERE id=5;` → 空，建立视图 | |
+| 3 | | `INSERT INTO mvcc_demo VALUES (5, 500);` |
+| 4 | `SELECT * FROM mvcc_demo WHERE id=5;` → 仍为空 | |
+| 5 | `UPDATE mvcc_demo SET balance=501 WHERE id=5;` → 更新 1 行 | |
+| 6 | `SELECT * FROM mvcc_demo WHERE id=5;` → 看到 501 | |
+| 7 | `ROLLBACK;` | |
+
+第 5 步是写操作，能处理 B 已提交的当前记录；第 6 步看到的是 **A 自己修改过的版本**，不是“仍然为空”。因此，不要把 RR 描述成所有语句都只看同一时刻的完整数据库状态。要保护“先检查再写”，应在事务中设计合适的约束及加锁策略，并验证实际锁范围；不能仅靠先做普通 SELECT。
+
+## 4. 锁体系：全局锁、表锁、MDL、意向锁与自增锁
+
+### 4.1 按作用范围理解
+
+| 类型 | 作用与特点 |
+| --- | --- |
+| 全局读锁 | `FLUSH TABLES WITH READ LOCK`（FTWRL）用于某些备份/切换场景，会阻塞写入；锁由持有它的连接释放或断开时释放 |
+| 只读配置 | `read_only`、`super_read_only` 是服务器只读策略，**不是全局锁**；对特权用户及复制线程的行为不同 |
+| 显式表锁 | `LOCK TABLES ... READ/WRITE` 限制表的并发访问，有隐式提交等语义，使用前需核对事务边界 |
+| MDL 元数据锁 | 保护表定义，访问表时自动获取；防止使用中的表结构被不兼容 DDL 修改 |
+| 意向锁 IS/IX | InnoDB 的表级锁，声明事务打算在表中获取行级 S/X 锁，便于快速判断表锁是否兼容 |
+| AUTO-INC 锁 | 自增值分配的特殊**表级**锁；是否使用及持有方式取决于插入类型和 `innodb_autoinc_lock_mode` |
+| 行锁 | 实际锁定索引记录和/或间隙，详见第 5 节 |
+
+共享锁 S 允许多个事务同时持有；排他锁 X 与其他事务对同一记录的 S、X 锁不兼容。`FOR SHARE` 通常请求 S 锁，`FOR UPDATE` 通常请求 X 锁。普通快照读不需要等待这些记录锁，但另一个加锁读或写操作可能等待。
+
+IS 与 IX 彼此兼容；例如表级 S 与 IX 冲突，表级 X 与 IS/IX 冲突。普通 DML 使用的意向锁不意味着所有行都被锁住。
+
+### 4.2 MDL 排队：不一定是死锁
+
+```text
+A：BEGIN; SELECT ... FROM t;  ──持有 MDL 读锁，事务未结束
+B：ALTER TABLE t ...          ──申请 MDL 写锁，等待 A
+C：SELECT ... FROM t          ──可能排在 B 后等待
+```
+
+这是典型的**阻塞链**，不一定有循环等待，因此不能直接称为死锁。MDL 写请求通常优先于后来的读请求，具体调度受服务器配置等影响；长期等待的 DDL 可能使后续访问堆积。显式事务访问过的表，其相关 MDL 通常持有到事务结束；自动提交的单条语句则通常在语句结束释放。
+
+排查时先找持有者，再评估终止等待中的 DDL 或长事务的影响；不要直接批量杀连接。`lock_wait_timeout` 控制 MDL 等锁的等待，并非 InnoDB 行锁等待超时。
+
+```sql
+SHOW FULL PROCESSLIST;
+SELECT * FROM performance_schema.metadata_locks WHERE LOCK_STATUS = 'PENDING';
+SELECT * FROM sys.schema_table_lock_waits;  -- 要求相关 instrumentation 已启用
+SET SESSION lock_wait_timeout = 30;         -- 在执行 DDL 的会话设置
+```
+
+### 4.3 自增锁模式
+
+`innodb_autoinc_lock_mode`：0（traditional）、1（consecutive）、2（interleaved）。0 对插入类语句使用语句级 AUTO-INC 表锁；1 对可预知行数的简单插入使用更轻量的分配机制，对部分批量插入使用表锁；2 允许不同语句的自增值交错。5.7 常见默认值为 1，8.0 默认为 2，以实际变量为准。
+
+自增值不是无间断流水号：回滚、并发、分配预留都可能产生空洞。mode 2 对基于语句的复制可能不安全；ROW 记录行变更，通常适合该模式。
+
+## 5. InnoDB 行锁与加锁规则
+
+### 5.1 三种常见锁
+
+行锁作用于**索引记录及索引间隙**，不是简单地锁住 SQL 文本中的条件。若没有合适索引，InnoDB 仍会使用聚簇索引（必要时为隐藏聚簇索引）扫描。
+
+```text
+已有索引值：   5          10          20
+间隙：       (-∞,5)     (5,10)      (10,20)      (20,+∞)
+临键锁示意：  (-∞,5]     (5,10]      (10,20]      (20,+∞)
+```
+
+| 锁 | 锁定内容 | 作用 |
+| --- | --- | --- |
+| Record Lock | 某条索引记录 | 控制对该记录的修改或加锁读取 |
+| Gap Lock | 两条记录之间的开区间 | 抑制其他事务向该间隙插入 |
+| Next-Key Lock | 记录锁 + 该记录之前的间隙锁 | 既保护记录，又保护范围内的插入 |
+
+末尾通过 supremum 等内部记录表示尾部间隙，不应将 `+∞` 理解成真实数据。不同事务的普通间隙锁可以共存，间隙锁主要是“禁止插入”，并不是普通意义的互斥锁；插入时需要的**插入意向锁**可能因已有间隙锁而等待。不同位置的插入意向锁通常可以并发，但还可能因唯一键、外键或其他锁发生冲突。
+
+### 5.2 常见加锁场景及边界
+
+以下是 RR、InnoDB、加锁读的经验模型，而不是不看执行计划就能精确计算的通用公式：
+
+| 查询形态 | 常见行为与注意事项 |
+| --- | --- |
+| 完整唯一索引等值命中 | 对找到的记录通常使用记录锁，不必保护其前面的间隙 |
+| 完整唯一索引等值未命中 | 通常保护目标值所在间隙，阻止其他事务插入该位置 |
+| 非唯一索引等值或范围查询 | 通常锁扫描到的索引范围，可能包括边界外的间隙或记录；排他锁通过二级索引查找时还会锁相应聚簇索引记录 |
+| 无合适索引 | 可能扫描并锁住大量聚簇索引记录及间隙，严重时效果接近锁全表；这不等于获取了同一种显式表锁 |
+| `LIMIT` | 可能提前停止扫描，但排序、回表、过滤及执行计划会改变扫描量；不能断言只锁返回的 N 行 |
+
+复合唯一索引只按前缀查询、使用 `NULL`、条件不完整，或优化器根本没有采用该索引时，不应直接套用“唯一等值命中只锁一条”的结论。RC 下通常关闭搜索和扫描使用的间隙锁，但外键检查、重复键检查等仍可能使用间隙锁；不匹配记录的锁释放也取决于语句和执行过程。
+
+RC 下的 UPDATE 还可能使用**半一致性读**：遇到已被其他事务锁住的行时，先取最近已提交版本供服务器判断 WHERE；如果不匹配，可避免等待，如果匹配则重新读取并尝试获取锁，必要时等待。它不是允许修改未提交数据，也不适用于推断所有 SQL 的锁行为。
+
+### 5.3 双会话实验：唯一键命中与未命中
+
+```sql
+CREATE TABLE lock_demo (
+    id INT PRIMARY KEY,
+    score INT NOT NULL,
+    KEY idx_score (score)
+) ENGINE=InnoDB;
+INSERT INTO lock_demo VALUES (5, 10), (10, 20), (20, 30);
+```
+
+两会话均使用 RR；先确保表只有上述数据：
+
+| 步骤 | 会话 A | 会话 B |
+| --- | --- | --- |
+| 1 | `START TRANSACTION;` | |
+| 2 | `SELECT * FROM lock_demo WHERE id=10 FOR UPDATE;` | |
+| 3 | | `UPDATE lock_demo SET score=21 WHERE id=10;` → 等待 |
+| 4 | `COMMIT;` | B 的更新继续，完成后提交 |
+
+接着在 A 执行 `START TRANSACTION; SELECT * FROM lock_demo WHERE id=12 FOR UPDATE;`，再由 B 执行 `INSERT INTO lock_demo VALUES (12, 40);`：B 通常会等待，因为 12 所在的 `(10,20)` 间隙受到保护。A 执行 `COMMIT` 或 `ROLLBACK` 后 B 才能继续。若要再次实验，先清理新插入的行。
+
+查看计划与锁：
+
+```sql
+EXPLAIN SELECT * FROM lock_demo WHERE score=20 FOR UPDATE;
+-- 在第三个连接观察，需相应权限；具体记录和模式依版本及执行状态而异
+SELECT ENGINE_TRANSACTION_ID, OBJECT_NAME, INDEX_NAME, LOCK_TYPE,
+       LOCK_MODE, LOCK_STATUS, LOCK_DATA
+FROM performance_schema.data_locks
+WHERE OBJECT_NAME = 'lock_demo';
+SELECT * FROM performance_schema.data_lock_waits;
+```
+
+`EXPLAIN` 只能帮助判断访问路径，不是完整的锁清单。实际冲突还取决于隔离级别、数据分布、唯一性检查和事务时序；结合 `data_locks` 与双会话实验判断。
+
+## 6. 死锁、锁等待与长事务
+
+### 6.1 锁等待和死锁有什么区别
+
+- **锁等待**：A 等 B 持有的锁，不一定形成环；B 提交后 A 通常可继续。
+- **死锁**：多个事务形成等待环，彼此无法自行前进。例如 A 持有行 1、等待行 2，同时 B 持有行 2、等待行 1。
+
+```text
+A 持有 id=1 ──等待──> id=2（B 持有）
+B 持有 id=2 ──等待──> id=1（A 持有）
+```
+
+InnoDB 默认启用死锁检测，发现死锁时选择一个受害事务回滚，通常倾向于较小的事务；业务应对整个事务进行**有限次数重试**，配合退避和幂等，不能只重试失败语句。高并发热点场景关闭死锁检测有时可减轻检测开销，但会改为依赖超时，必须结合业务和监控谨慎评估。
+
+行锁等待超时通常报 `Lock wait timeout exceeded`；默认 `innodb_rollback_on_timeout=OFF` 时，InnoDB 一般只回滚当前语句，事务及其此前持有的锁可能仍在。应用通常应显式 `ROLLBACK` 后再决定是否重试。超时本身不能证明不存在死锁，尤其是关闭死锁检测或涉及引擎无法检测的锁时。
+
+例如准备好 `lock_demo` 后，两会话均开启事务，A 更新 `id=5`，B 更新 `id=10`；接着 A 更新 `id=10`，A 开始等待；此时 B 再更新 `id=5`，形成环。通常其中一个事务收到死锁错误并被回滚，另一个得以继续。实验后两个会话都应检查事务状态并结束事务。
+
+### 6.2 如何定位与规避
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+-- 查 LATEST DETECTED DEADLOCK 中各事务持有/等待的索引与锁
+SELECT * FROM sys.innodb_lock_waits;
+SELECT * FROM information_schema.INNODB_TRX ORDER BY trx_started;
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+SHOW VARIABLES LIKE 'innodb_deadlock_detect';
+```
+
+`LATEST DETECTED DEADLOCK` 只展示最近一次检测到的死锁；需要持续排查时，可评估开启 `innodb_print_all_deadlocks` 写入错误日志。8.0 可结合 `performance_schema.data_locks` 和 `data_lock_waits`；5.7 使用的部分 `INFORMATION_SCHEMA` 锁表已在 8.0 移除。
+
+优先措施：统一访问记录的顺序、缩小事务与扫描范围、建立合适索引、拆分大批量操作、减少热点。RC 可能减少部分间隙锁冲突，但不会消灭所有死锁，也不能替代业务一致性设计。
+
+### 6.3 长事务的代价
+
+长事务可能延迟 purge、长期持有行锁和 MDL、使回滚耗时增加；大量修改组成的大事务还会增加复制和恢复压力。一个 `Sleep` 连接也可能持有未结束的事务；要结合事务开始时间、连接状态和实际锁，而不是只看当前 SQL。
+
+不要把远程调用或长时间等待放进持锁事务；明确异常路径的回滚与连接归还。终止连接前应确认业务影响：`KILL` 后回滚大事务也可能很慢。Spring 的 `@Transactional` 还要注意代理模式下同类内部调用可能不经过事务代理。
+
+## 7. binlog 格式与提交
+
+### 7.1 STATEMENT、ROW、MIXED
+
+| 格式 | 记录内容 | 主要取舍 |
+| --- | --- | --- |
+| STATEMENT（SBR） | 执行的 SQL 语句及相关上下文 | 日志通常较小，但部分语句受执行顺序、函数或环境影响，重放可能不安全 |
+| ROW（RBR） | 行变更事件及必要的行镜像 | 更便于确定性复制和 CDC；大批量变更可能产生较大日志 |
+| MIXED（MBR） | 由服务器根据规则选择语句或行格式 | 折中，但不能保证规避所有应用层问题 |
+
+不应笼统说 `NOW()`、`RAND()` 一定导致 STATEMENT 复制错误：MySQL 对部分函数记录或传递了执行上下文；仍有不安全语句，例如某些不确定执行顺序、`UUID()` 等场景，应查看具体版本的警告和手册。ROW 通常是生产复制与 CDC 的优先选择，但不是绝对保证主从一致：过滤配置、复制错误、从库额外写入等仍可能导致差异。
 
 ```sql
 SHOW VARIABLES LIKE 'binlog_format';
 SHOW VARIABLES LIKE 'binlog_row_image';
-SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';   -- 8.0；5.7 为 expire_logs_days
-SHOW STATUS LIKE 'Binlog_cache_disk_use';
-SHOW MASTER STATUS;                                 -- 8.0.22+ 亦可 SHOW BINARY LOG STATUS
--- 解析 binlog（bash）：mysqlbinlog --base64-output=decode-rows -v \
---   --start-datetime="2024-01-01 10:00:00" binlog.000003
+SHOW GLOBAL STATUS LIKE 'Binlog_cache%';
 ```
 
-### 7.5 一句话速记
+`binlog_row_image=FULL` 包含完整行镜像；`MINIMAL` 可减少部分镜像，具体哪些列记录取决于事件类型和表结构。修改前确认 CDC、审计和恢复工具的要求。ROW 闪回也需要足够的旧值、正确的日志与工具，不能保证所有误操作都能反转。
 
-**生产一律 ROW：复制安全、支持 CDC 与闪回；STATEMENT 有不确定性函数风险；MIXED 实践少用。**
+MySQL 8.0 常见默认格式为 ROW，实际以配置为准。binlog 必须保留足够久，覆盖备份周期、恢复窗口及从库追赶需求；过早清理会使恢复或复制缺少必要日志。日志占用增长也需要监控，必要时归档并演练恢复。
 
-## 8. 主从复制原理与 GTID、半同步、并行复制
+### 7.2 提交与恢复
 
-### 8.1 核心原理
+事务中的 binlog 事件先进入会话的事务缓存，大事务可能使用临时文件；`Binlog_cache_disk_use` 可结合 `Binlog_cache_use` 观察溢出情况，不应仅凭绝对值调大缓存。组提交将多个事务的相关步骤批量处理，常用 flush → sync → commit 描述；`sync_binlog` 控制 binlog 同步策略。
 
-**异步复制流程**：主库事务提交写 binlog → **binlog dump 线程**（每个从库一个）把 binlog 推给从库 → 从库 **IO 线程**写入本地 **relay log** 并更新 `Read_Master_Log_Pos` → 从库 **SQL/worker 线程**重放 relay log 并更新 `Exec_Master_Log_Pos`。两个进度的差值就是延迟来源。
-
-**GTID（5.6+）**：`gtid_mode=ON` 后每个事务有全局唯一编号 `source_id:transaction_id`，从库用 `gtid_executed` 记录已执行集合。好处：主从切换无需人工算位点（`MASTER_AUTO_POSITION=1` 自动补差异）、不会重复执行、可做会话级一致性等待。
-
-**半同步复制（5.5+ 插件）**：主库提交后至少等一个从库确认收到 binlog 才返回成功。`rpl_semi_sync_master_wait_point` 两个取值：`AFTER_SYNC`（**5.7 默认**）先写 binlog、等 ACK、再提交，主库故障切换**不丢已提交事务**；`AFTER_COMMIT`（5.5/5.6 行为）先提交再等 ACK，主库崩溃可能丢数据。注意 `rpl_semi_sync_master_timeout`（默认 10000ms）超时会**退化为异步**，重新引入丢数据窗口。
-
-**并行复制（从库 `slave_parallel_workers>0` 时启用）**：5.6 按库并行（`DATABASE`，单库热点无效）；**5.7 默认基于组提交**（`LOGICAL_CLOCK`，同组提交内事务可并行，单库也有效）；8.0 增加基于 `WRITESET` 的行级冲突检测，粒度最细。
-
-### 8.2 面试问答
-
-- **Q1：主从复制的完整流程？** 主库 binlog dump 线程读 binlog 推给从库；从库 IO 线程写 relay log；从库 SQL/worker 线程重放 relay log。三个线程（dump、IO、SQL）职责分明。
-- **Q2：GTID 相比位点复制好在哪？** ① 切换时不需要人工计算位点；② 事务唯一标识天然避免重复执行；③ 结合 `WAIT_FOR_EXECUTED_GTID_SET` 可做"写后读一致"保证。
-- **Q3：为什么推荐 `AFTER_SYNC`？** 它在引擎提交**前**等从库 ACK，因此主库 commit 成功即意味着从库已收到该事务，故障切换不丢数据；`AFTER_COMMIT` 在等待期间主库崩溃就会出现"客户端收到成功但新主没有该数据"。
-- **Q4：并行复制的原理？** 5.6 按库并行；5.7 基于组提交的 LOGICAL_CLOCK，同一提交组内事务在主库无锁冲突故可并行重放；8.0 的 WRITESET 进一步按行级是否冲突判断，并行度更高。
-- **Q5：半同步能保证强一致吗？主从切换怎么做到不丢数据？** 不能——它只保证"至少一个从库收到 binlog"，**不保证已重放**，主库返回成功时从库可能还没执行完，要读一致性仍需 GTID 等待或强制走主库。切换不丢数据靠：半同步 `AFTER_SYNC` 保证已提交事务至少落在一个从库 + GTID 自动补齐差异 + 切换前确认 `Executed_Gtid_Set` 已追平 + 配合 MHA/Orchestrator 自动化（见 [./03-MySQL调优主从与分库分表.md](./03-MySQL调优主从与分库分表.md)）。
-
-### 8.3 高频追问与陷阱
-
-- 陷阱：`slave_parallel_workers` 调大不等于更快。并行度受主库提交组大小与冲突比例限制，盲目调大可能加剧锁冲突。
-- 陷阱：从库 `read_only=ON` 对复制线程无效（复制线程仍有写权限），且持有 SUPER 的账号可绕过。
-
-### 8.4 代码/配置/命令示例
+InnoDB 与 binlog 的提交需要协调：简化理解为 redo 准备、写入并按配置同步 binlog、再完成引擎提交；崩溃恢复根据日志和事务状态决定提交或回滚。具体实现和刷盘保证取决于版本及配置。`sync_binlog=1` 与 `innodb_flush_log_at_trx_commit=1` 是常见的强持久性配置，但仍依赖存储正确执行刷盘。
 
 ```sql
-SHOW MASTER STATUS;                   -- 主库位点；8.0.22+ 亦可 SHOW BINARY LOG STATUS
-SHOW SLAVE STATUS\G                   -- 8.0.22+ 亦可 SHOW REPLICA STATUS（见第 9 节三字段）
-SHOW VARIABLES LIKE 'gtid_mode';
-SHOW VARIABLES LIKE 'slave_parallel_type';   -- DATABASE / LOGICAL_CLOCK / WRITESET
-SHOW VARIABLES LIKE 'slave_parallel_workers';
-SELECT WAIT_FOR_EXECUTED_GTID_SET('3f9c...:1-100', 1);   -- 写后读一致，超时 1 秒
+SHOW MASTER STATUS;  -- MySQL 8.0 常用；不同版本的新命令名称请查对应手册
 ```
 
-### 8.5 一句话速记
+解析 ROW 事件可使用 `mysqlbinlog --base64-output=decode-rows -vv`；输出通常是注释形式的行事件，不是可直接执行的完整恢复 SQL。
 
-**主库 dump 线程推 binlog → 从库 IO 线程写 relay log → SQL/worker 线程重放；GTID 免位点、AFTER_SYNC 半同步不丢已提交事务、LOGICAL_CLOCK 并行复制。**
+## 8. 主从复制、GTID、半同步和并行复制
+
+### 8.1 异步复制流程
+
+```text
+主库事务提交
+  → binlog
+  → 主库 binlog dump 线程发送
+  → 从库接收线程（IO）写 relay log
+  → 从库应用线程（SQL / workers）执行并提交
+  → 从库查询才能看到已应用的数据
+```
+
+接收和应用是不同进度：数据到达 relay log 不代表已在从库可查询。8.0 的较新版本使用 source/replica 命名，旧版本常使用 master/slave；具体命令和变量名按版本确认。
+
+### 8.2 GTID 与切换
+
+GTID 为事务提供全局标识，常见形式为 `server_uuid:sequence_number`；`gtid_executed` 是已执行事务集合。启用自动定位后，从库通过比较 GTID 集合请求缺少的事务，降低手工计算文件位点的成本，并避免同一 GTID 被重复应用。
+
+GTID **不会凭空找回已丢失或已清理的 binlog**。故障切换时仍需确认候选节点包含需要的事务、复制状态和数据完整性，并处理旧主隔离；GTID 是工具，不等于零数据丢失。
+
+### 8.3 半同步的保证和局限
+
+半同步正常工作时，主库等待配置数量的从库确认已接收并将事务事件写入、刷新到 relay log，随后才向客户端返回成功；**不等待从库应用完成**。等待超时可能退化为异步，因此不能无条件宣称“不丢数据”。
+
+- `AFTER_SYNC`：主库同步 binlog 后等待 ACK，再提交存储引擎。
+- `AFTER_COMMIT`：先提交存储引擎，再等待 ACK；等待期间该事务可能已对主库其他会话可见，主库故障时可能出现已观察到的数据未到达新主。
+
+即便是 `AFTER_SYNC`，也需要半同步当时没有退化、收到 ACK 的副本及其日志仍可用、选主和恢复流程正确，才能利用已收到的事务降低丢失风险。它不保证所有从库都收到，也不提供从库即时读一致。
+
+### 8.4 并行复制
+
+5.6 提供按库并行；5.7 引入 `LOGICAL_CLOCK`，可以按提交依赖在同一库内并行应用。8.0 可使用基于写集合的依赖跟踪，向从库提供更细的依赖信息。**WRITESET 是主库依赖跟踪策略，不是 `slave_parallel_type` 的取值**；从库仍需配置对应的并行应用方式。
+
+不同小版本的默认 worker 数、变量名称和默认策略不同；例如 8.0.27 起默认启用多线程应用及提交顺序保持。增加 worker 也可能受热点冲突、大事务、DDL 和机器资源限制，并非越多越快。
+
+```sql
+SHOW REPLICA STATUS\G  -- 8.0.22+；旧版本使用 SHOW SLAVE STATUS\G
+SHOW VARIABLES LIKE 'gtid_mode';
+SHOW VARIABLES LIKE '%parallel%workers';
+SHOW VARIABLES LIKE '%parallel%type';
+SHOW VARIABLES LIKE 'binlog_transaction_dependency_tracking';
+```
 
 ## 9. 主从延迟与读写分离一致性
 
-### 9.1 核心原理
+### 9.1 延迟从哪里来
 
-| 延迟原因 | 说明 | 对策 |
+| 环节 | 可能原因 | 排查与应对 |
 | --- | --- | --- |
-| 从库单线程重放（5.6 前） | 主库并发写、从库串行重放 | 升级 5.7/8.0 开并行复制 |
-| **大事务** | 事务在从库必须整体原子重放，期间进度不动 | 拆小事务（批量更新按主键分批） |
-| 从库读压力大 | 读查询抢走 CPU/IO | 读库扩容、加索引、限流 |
-| 主库写入突增 | 写入速率持续超过重放速率 | 分库分表、升级从库配置、多从库分流 |
-| 网络带宽/延迟 | 大 ROW 日志传输慢 | 提高带宽、`binlog_row_image=MINIMAL` |
-| 从库执行大表 DDL | DDL 阻塞重放 | 用 gh-ost/pt-osc 并低峰执行 |
+| 发送/接收 | 网络、主库压力、日志过大 | 检查接收线程、网络和吞吐 |
+| 从库应用 | 大事务、DDL、热点冲突、并行度不足 | 检查 worker 状态和慢事务，优化事务大小及并行配置 |
+| 从库资源 | 查询与复制竞争 CPU/IO | 查看资源、慢查询及索引，必要时扩容或分流 |
 
-**读写分离一致性方案（强度递增）**：① 关键业务**强制走主库**（下单后查订单）；② **GTID 等待**：写完取 GTID，读前 `WAIT_FOR_EXECUTED_GTID_SET(gtid, timeout)`；③ 半同步 + 读写分离（保证从库收到、不保证重放）；④ **延迟感知路由**（中间件探测从库延迟，超阈值自动回主库）；⑤ 最终一致 + 业务补偿。
+`Read_Master_Log_Pos` 与 `Exec_Master_Log_Pos` 表示不同进度，**文件相同时**位置差可作为待处理日志量的粗略线索；文件不同时不能直接相减，字节差也不是时间延迟。并行复制时还需要考虑 worker 状态和执行空洞。
 
-### 9.2 面试问答
+`Seconds_Behind_Master` / `Seconds_Behind_Source` 是近似指标，网络或接收线程落后、时钟等情况可能使它失真；`NULL` 可能表示应用线程未运行，或接收线程未运行且 relay log 已处理完，应结合两个线程状态与错误信息判断。心跳表（如 `pt-heartbeat`）可从应用路径测量延迟，但仍要考虑时钟同步和采样间隔。可接受延迟由业务 SLO 决定，没有适用于所有部署的固定毫秒阈值。
 
-- **Q1：延迟多少算正常？** 同机房并行复制正常时毫秒到几十毫秒，跨机房几十到几百毫秒；**秒级以上即异常**，需定位大事务、从库压力还是并行度不足。
-- **Q2：怎么准确测量主从延迟？** 不要只看 `Seconds_Behind_Master`。用 `pt-heartbeat`（主库周期更新时间戳表，从库读表算差值）得到真实延迟；或结合 `Exec_Master_Log_Pos` 与 `Read_Master_Log_Pos` 差值估算。
-- **Q3：`Seconds_Behind_Master` 为什么不准？** 它比较从库 SQL 线程时间与 IO 线程收到事件的时间戳：网络阻塞时会失真、大事务期间进度不动可能显示很大、`NULL` 表示复制线程未运行（不是延迟 0）。用 `pt-heartbeat` 才能拿到真实延迟。
-- **Q4：写后立即读怎么保证一致性、大事务为什么特别伤主从？** 关键路径强制走主库、GTID 等待、中间件"写后读主"路由、缓存降低即时读依赖；大事务因为 binlog 事件在从库以事务为单位**原子重放**（并行复制下还会独占 worker），持续几十秒会让 `Exec_Master_Log_Pos` 长时间不动，延迟飙升且主库锁持有时间长。
+### 9.2 写后读一致性怎么保证
 
-### 9.3 高频追问与陷阱
-
-- 陷阱：把 `Seconds_Behind_Master=NULL` 理解成"无延迟"，它其实表示 IO 或 SQL 线程已停止，复制中断了；另外为减小日志改 `binlog_row_image=MINIMAL` 前必须确认下游 CDC 工具依赖完整行镜像。
-
-### 9.4 代码/配置/命令示例
-
-```sql
-SHOW SLAVE STATUS\G      -- 重点看 Slave_IO_Running / Slave_SQL_Running / Seconds_Behind_Master
-                         -- 以及 Retrieved_Gtid_Set / Executed_Gtid_Set 的差值
-SET GLOBAL rpl_semi_sync_master_timeout = 1000;
-SHOW VARIABLES LIKE 'relay_log_recovery';   -- ON 可从库重启后自动从最新位点恢复
+```text
+客户端写主库成功 → 立即读从库 → 从库可能尚未应用该事务 → 读到旧值
 ```
 
-### 9.5 一句话速记
+| 方案 | 能力与代价 |
+| --- | --- |
+| 关键读走主库 | 主库上已提交后通常可读到自己的写入；增加主库读压力，也要避免复用更早建立的 RR 快照 |
+| GTID 等待 | 获得本次写入的 GTID，在**目标从库**等待其执行后再读；超时或错误要回主库或明确报错 |
+| 写后短时间读主 / 延迟感知路由 | 降低读旧概率或按阈值控制风险；固定时间和近似延迟指标不能严格保证 |
+| 半同步 | 改善日志接收保障，但不保证从库已应用，单独使用不能保证写后读一致 |
+| 最终一致与补偿 | 适合允许短暂不一致的业务；需明确补偿、超时和用户体验 |
 
-**延迟主因=大事务+单线程重放+从库压力；并行复制与拆分大事务治本，GTID 等待与强制走主库保证写后读一致。**
+GTID 等待示意：
+
+```sql
+-- gtid_set 应从本次写入的可靠来源取得；示例 UUID 和序号仅占位
+SELECT WAIT_FOR_EXECUTED_GTID_SET('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:42', 1);
+-- 0 表示已执行，1 表示超时；SQL 错误也必须处理
+-- 成功后在同一个目标从库开启新的读事务，再执行查询
+```
+
+不要在等待成功后继续使用**等待前已建立的 RR 旧快照**：它可能仍看不到该事务。连接池与路由必须确保等待和后续读取落在同一个目标实例；若失败则按业务约定回主库或报错。
+
+```sql
+SHOW REPLICA STATUS\G
+-- 关注接收/应用线程状态、最后错误、延迟，以及 Retrieved_Gtid_Set / Executed_Gtid_Set
+```
 
 ## 10. 一致性备份与锁相关参数
 
-### 10.1 核心原理
+### 10.1 `--single-transaction` 的原理与限制
 
-**`mysqldump --single-transaction`**：对 InnoDB 表开启一个 RR 一致性快照事务，整个备份读的都是同一快照，**不阻塞写、无需全局锁**。要点：① 只对 **InnoDB** 有效（MyISAM 仍会被锁，且为取一致性位点会有短暂 FTWRL）；② 必须配合 **RR**（全局是 RC 时要在会话内指定）；③ 搭配 `--master-data=2`（5.7）/ `--source-data=2`（**8.0.26+ 改名**）把位点或 GTID 以注释写入备份文件便于 PITR；④ 备份期间禁止 DDL。物理备份用 XtraBackup / MySQL Enterprise Backup，热备且快，恢复需 `--prepare` 应用 redo。8.0 也推荐 `MySQL Shell` 的 `util.dumpSchemas`（并行、一致性快照）。
+`mysqldump --single-transaction` 为支持事务的表建立一致性快照，导出期间其他事务通常可继续修改 InnoDB 数据。它不是“整个备份过程完全无锁”：仍有 MDL；配合记录 binlog 位点的 `--source-data` / `--master-data` 时，启动阶段可能短暂获取全局读锁。等待已有写入结束也可能使这个阶段变长。
 
-| 参数 | 默认值 | 用途 |
-| --- | --- | --- |
-| `innodb_lock_wait_timeout` | 50 秒 | 行锁等待超时 |
-| `lock_wait_timeout` | 31536000 秒 | **MDL/表锁等待超时，必须显式调小** |
-| `innodb_deadlock_detect` / `innodb_print_all_deadlocks` | ON / OFF | 死锁主动检测 / 记录所有死锁到错误日志 |
-| `transaction_isolation`（5.7 为 `tx_isolation`） | REPEATABLE-READ | 隔离级别 |
-| `innodb_rollback_on_timeout` | OFF | 超时只回滚当前语句 |
+主要限制：
 
-### 10.2 面试问答
+1. 一致性快照适用于 InnoDB 等支持一致性读的事务表；MyISAM 等非事务表在导出过程中可能变化，**不会因为这个选项自动得到一致备份**。
+2. 不要在备份期间对相关表执行 `ALTER`、`DROP`、`RENAME`、`TRUNCATE` 等 DDL；可能阻塞、导致导出失败或破坏一致性，具体表现依语句和时序而定。
+3. 这是长时间快照，大库备份可能延迟 purge；逻辑恢复也可能较慢。物理备份工具有各自的准备和恢复步骤。
+4. 该选项和锁表选项的组合及权限要求应按客户端版本核对；`--source-data=2` 主要记录 binlog 文件和位点为注释，GTID 信息和导出行为由其他设置共同决定。
 
-- **Q1：`--single-transaction` 为什么能保证一致性？** 它借助 InnoDB 的 MVCC：备份会话的 RR 快照事务看到同一时刻的数据视图，期间其他事务的提交不影响它，因此无需全局读锁即可得到一致的数据集合。
-- **Q2：它有什么局限？** ① 只对事务引擎有效；② 备份期间不能执行 DDL（会破坏一致性且 DDL 需要 MDL 写锁会被快照事务阻塞）；③ 大库导出时间可能很长；④ 逻辑备份恢复慢。
-- **Q3：怎么用备份 + binlog 做 PITR？** 全量备份（含位点/GTID 注释）恢复到备份时刻 → 从备份位点开始用 `mysqlbinlog` 回放到目标时间（`--stop-datetime`）→ 若为误删则先闪回再回放。
-- **Q4：为什么 `lock_wait_timeout` 默认这么离谱？备份期间执行了 DDL 会怎样？** 它是 5.5 引入 MDL 时定的一年（31536000 秒），意味着 DDL 遇到长事务会长时间挂住而不失败，生产必须显式调小（如 30~60 秒）；备份期间执行 DDL 会让备份文件里部分表是新结构、部分是旧结构，恢复后数据与结构对不上，通常直接判定备份不可用。
+### 10.2 从备份恢复到指定时间
 
-### 10.3 高频追问与陷阱
+PITR（时间点恢复）的流程：恢复经过验证的全量备份 → 从对应的 binlog 文件和位点开始，按顺序回放后续日志 → 在目标操作之前停止 → 校验数据。时间点、时区、跨多个文件的顺序、事务边界和 GTID 均需纳入演练；**不要在生产库直接试回放**。
 
-- 陷阱：以为 `--single-transaction` 完全不加锁——它仍会短暂 FTWRL 以取得一致性位点，MyISAM 表也会被锁；另外别把 `innodb_lock_wait_timeout`（行锁）与 `lock_wait_timeout`（MDL/表锁）混为一谈。
-
-### 10.4 代码/配置/命令示例
-
-```bash
-# 逻辑备份：InnoDB 一致性快照 + 记录位点（8.0.26+ 用 --source-data=2）
-mysqldump -uroot -p --single-transaction --source-data=2 --routines --triggers \
-  --databases mydb > /backup/mydb_$(date +%F).sql
-# 恢复 + 回放到指定时间点
-mysql -uroot -p < /backup/mydb_2024-01-01.sql
-mysqlbinlog --start-position=1234 --stop-datetime="2024-01-01 10:30:00" binlog.000005 | mysql -uroot -p
+```powershell
+# 示例仅用于隔离测试环境；文件名、位点与时间必须来自真实备份。
+# 8.0.26+ 使用 --source-data；较旧客户端使用 --master-data。
+mysqldump -u backup_user -p --single-transaction --source-data=2 --routines --triggers --databases mydb --result-file=backup.sql
+mysql -u restore_user -p -e "SOURCE backup.sql"
+mysqlbinlog --start-position=1234 --stop-datetime="2024-01-01 10:30:00" binlog.000005 --result-file=replay.sql
+mysql -u restore_user -p -e "SOURCE replay.sql"
 ```
 
-### 10.5 一句话速记
+示例只覆盖单个 binlog 文件；真实恢复可能需要依次处理多个文件及目标时间前的完整事务。备份包含建库语句但不代表自动包含所有用户和权限。必须验证备份、日志保留、恢复权限及恢复后数据；若误操作已包含在恢复范围内，应停止在误操作之前或依据经过验证的补偿方案处理。
 
-**`--single-transaction` 靠 MVCC 快照做无锁一致性备份（仅 InnoDB），配 `--source-data=2` 记位点做 PITR；`lock_wait_timeout` 必须调小。**
+### 10.3 常见参数
 
-## 自测题（含答案要点）
+| 参数 | 常见默认值 | 用途与注意 |
+| --- | --- | --- |
+| `innodb_lock_wait_timeout` | 50 秒 | InnoDB 行锁等待超时；不是 MDL 超时 |
+| `lock_wait_timeout` | 31536000 秒 | MDL 等等待超时；建议为 DDL 会话设合理上限 |
+| `innodb_deadlock_detect` | ON | 是否主动检测 InnoDB 死锁 |
+| `innodb_print_all_deadlocks` | OFF | 是否将所有 InnoDB 死锁写入错误日志 |
+| `innodb_rollback_on_timeout` | OFF | 行锁超时默认只回滚语句；应用仍需处理事务 |
+| `transaction_isolation` | REPEATABLE-READ | 默认事务隔离级别 |
 
-1. **ACID 各靠什么实现？** —— undo / 业务约束 / MVCC+锁 / redo。
-2. **MySQL 默认隔离级别？** —— REPEATABLE READ（8.0 变量 `transaction_isolation`，5.7 为 `tx_isolation`）。
-3. **RC 与 RR 的两点核心差异？** —— ReadView 生成时机、是否加间隙锁。
-4. **ReadView 四个字段？** —— `m_ids`、`min_trx_id`、`max_trx_id`、`creator_trx_id`。
-5. **可见性判断四条规则？** —— creator 自己可见；小于 min 可见；大于等于 max 不可见；中间看是否在 m_ids。
-6. **两个关键隐藏列与长度？** —— `DB_TRX_ID`(6B)、`DB_ROLL_PTR`(7B)。
-7. **RR 完全解决幻读了吗？** —— 快照读靠 MVCC、当前读靠 Next-Key Lock，混用时仍可能幻读。
-8. **快照读与当前读分别包括哪些语句？** —— 普通 SELECT / `FOR UPDATE`、`FOR SHARE`、UPDATE、DELETE、INSERT。
-9. **MDL 锁何时释放？意向锁的作用？** —— 事务结束时（不是语句结束时）；意向锁是表级标志位表示表内已有行锁，避免加表锁时逐行扫描，意向锁之间不冲突。
-10. **`innodb_autoinc_lock_mode` 默认值？binlog 默认格式与选型？** —— 8.0 为 2、5.7 为 1；binlog 自 5.7.7/8.0 默认 ROW，生产一律 ROW（复制安全 + CDC + 闪回）。
-11. **唯一索引等值未命中加什么锁？无索引列 `FOR UPDATE` 为什么锁全表？** —— 间隙锁；行锁加在索引上，全表扫描导致每条记录及其间隙都被加临键锁。
-12. **插入意向锁与间隙锁的关系？** —— 它是一种特殊间隙锁；同间隙不同位置插入可并发，但与已有间隙锁冲突。
-13. **死锁如何处理与规避？长事务的四大危害？** —— 等待图检测后回滚代价最小的事务；统一加锁顺序、缩小事务与锁范围。长事务危害：undo 不回收、锁持有久、回滚极慢、主从延迟。
-14. **主从复制的三个线程？半同步 `AFTER_SYNC` 与 `AFTER_COMMIT` 的区别？** —— 主库 binlog dump、从库 IO、从库 SQL/worker；前者提交前等 ACK（切换不丢已提交事务），后者先提交再等（可能丢）。
-15. **`--single-transaction` 的原理与局限？** —— 靠 InnoDB RR 快照事务无锁备份；仅对事务引擎有效，备份期间禁止 DDL。
+这些是常见 MySQL 8.0 默认值，不同版本或发行版可能不同；生产环境先 `SHOW VARIABLES` 确认，不要直接照搬调参。
+
+## 自测题
+
+1. **ACID 分别解决什么问题？** 原子性是整体提交或撤销；一致性依赖约束和业务逻辑；隔离性控制并发可见性；持久性依赖日志、刷盘和存储。
+2. **RC 和 RR 的快照有何区别？** RC 每次一致性读创建新视图；RR 通常首次一致性读创建、后续复用。自己的修改仍可见。
+3. **ReadView 如何判断版本？** 先判断是否为自己，再比较下界和上界，中间范围检查活跃事务集合；不可见则沿 undo 重建旧版本。
+4. **RR 为什么仍可能看到不同结果？** 普通读使用旧视图，当前读/写操作处理当前记录，且普通读能看到事务自己的修改。
+5. **唯一索引未命中为什么可能阻塞插入？** RR 下加锁读可能锁住目标所在间隙；插入意向锁须等待间隙保护解除。
+6. **MDL 等待一定是死锁吗？** 不一定；长事务持锁、DDL 等待、后续查询排队可能只是阻塞链。
+7. **死锁和锁超时如何处理？** 死锁通常回滚受害事务；锁超时默认通常只回滚当前语句。应用应明确回滚并按幂等策略有限重试。
+8. **半同步为什么不能保证从库立即读到写入？** ACK 表示日志已接收并持久化到 relay log，不代表事务已在从库应用；超时还可能退化为异步。
+9. **GTID 等待成功后为什么还要注意事务边界？** 已有 RR 快照可能早于目标事务；应在目标从库建立新的读视图。
+10. **`--single-transaction` 能一致备份 MyISAM 吗？** 不能；它依赖事务引擎的一致性快照，且备份期间仍需管理 DDL 和可能的短暂全局锁。
 
 ## 背诵卡片
 
-1. 原子性=undo，持久性=redo，隔离性=MVCC+锁，一致性是前三者的结果；默认 RR，互联网常用 RC。
-2. SQL 标准里 RR 允许幻读，只有 SERIALIZABLE 禁止；不可重复读看同一行被改，幻读看行数变化。
-3. 隐藏列 `DB_TRX_ID`(6B) / `DB_ROLL_PTR`(7B)，无主键时才有 `DB_ROW_ID`。
-4. ReadView 四字段：`m_ids` / `min_trx_id` / `max_trx_id` / `creator_trx_id`。
-5. `max_trx_id` 是"下一个待分配的事务 ID"，不是最大活跃 ID。
-6. 可见性：自己可见、小于 min 可见、大于等于 max 不可见、中间看 m_ids。
-7. RC 每次 SELECT 新建 ReadView；RR 事务首次 SELECT 建一次并复用。
-8. undo 类型：INSERT→DELETE，UPDATE→反向 UPDATE，DELETE→INSERT。
-9. MVCC 只作用于快照读；当前读永远读最新并加锁。
-10. RR 幻读：快照读避免了，当前读靠 Next-Key Lock 避免，混用仍可能幻读。
-11. 间隙锁之间不冲突，只与插入意向锁冲突。
-12. MDL 读锁在事务结束才释放，是 DDL 卡库的元凶。
-13. `lock_wait_timeout` 默认 31536000 秒，必须显式调小。
-14. 意向锁 IS/IX 是表级，彼此不冲突，只与表锁冲突；`FLUSH TABLES WITH READ LOCK` 是全库读锁，InnoDB 备份不需要它。
-15. `innodb_autoinc_lock_mode`：8.0 默认 2（interleaved），5.7 默认 1（consecutive）。
-16. 行锁加在索引上；无索引 `FOR UPDATE` = 锁全表。
-17. 唯一索引等值命中=记录锁，未命中=间隙锁，非唯一索引等值=临键锁。
-18. 临键锁 = 记录 + 前面的间隙，左开右闭；插入意向锁让同间隙不同位置的插入可并发。
-19. `innodb_deadlock_detect` 默认 ON，回滚代价最小的事务。
-20. `innodb_lock_wait_timeout` 默认 50 秒，`innodb_print_all_deadlocks` 默认 OFF。
-21. 死锁规避：统一加锁顺序、缩小事务、用索引缩小锁范围、拆大事务。
-22. 8.0 用 `performance_schema.data_locks`/`data_lock_waits`，`innodb_locks` 已移除。
-23. 长事务监控：`INNODB_TRX` 的 `trx_started` 与 `Innodb_history_list_length`。
-24. `innodb_rollback_on_timeout` 默认 OFF，超时只回滚当前语句。
-25. binlog 三格式：STATEMENT 小但不确定、ROW 安全但大、MIXED 折中；组提交三阶段 flush → sync → commit。
-26. 主从三线程：主库 dump、从库 IO、从库 SQL/worker。
-27. GTID 让主从切换无需手算位点，`MASTER_AUTO_POSITION=1` 自动补齐。
-28. 半同步 `AFTER_SYNC` 在提交前等 ACK，故障切换不丢已提交事务；并行复制 5.6 按库、5.7 基于组提交、8.0 基于 WRITESET。
-29. `Seconds_Behind_Master` 不可靠（`NULL` 表示复制中断），用 `pt-heartbeat` 测真实延迟。
-30. 读写分离一致性：强制走主库 / GTID 等待 / 半同步 / 延迟感知路由。
-31. `mysqldump --single-transaction` 靠 MVCC 快照免锁（仅 InnoDB）；`--master-data=2`（5.7）在 8.0.26+ 改名 `--source-data=2`。
+1. ACID 需要日志、锁、约束、业务逻辑及正确配置共同实现。
+2. RC 每次一致性读创建视图；RR 首次一致性读创建并复用。
+3. 一致性读读取可见旧版本，也能看到本事务自己的修改；当前读/写处理当前记录。
+4. InnoDB 锁作用于索引记录和间隙；具体范围取决于索引、扫描路径、隔离级别及数据。
+5. 间隙锁通常彼此兼容，但可能阻塞插入意向锁；唯一等值命中与未命中要分别分析。
+6. MDL、行锁等待和死锁是不同问题；长事务既可能持锁，也可能延迟 purge。
+7. ROW 有利于复制和 CDC，但不保证所有故障下主从绝对一致；redo 与 binlog 用途不同。
+8. 半同步等待接收，不等待应用；GTID 自动定位也不能恢复已经丢失的日志。
+9. 写后读优先考虑读主或目标从库 GTID 等待，并避免复用旧快照。
+10. 一致性备份依赖引擎和选项；备份成功不等于恢复成功，必须演练。
+
+## 参考资料
+
+- [MySQL 8.0：事务隔离级别](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html)
+- [MySQL 8.0：一致性非锁定读](https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html)
+- [MySQL 8.0：InnoDB 锁及各语句加锁](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html)、[加锁规则](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html)
+- [MySQL 8.0：半同步复制](https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html)
+- [MySQL 8.0：mysqldump](https://dev.mysql.com/doc/refman/8.0/en/mysqldump.html)
