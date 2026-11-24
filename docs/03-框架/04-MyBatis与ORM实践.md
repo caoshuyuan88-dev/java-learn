@@ -21,6 +21,14 @@
 | MyBatis-Plus 常用能力 | ★★★★☆ | 配置实践 / 场景题 |
 | ORM 选型、慢 SQL 与常见坑 | ★★★★☆ | 故障排查 / 场景题 |
 
+### 零基础阅读：MyBatis 与数据库之间的边界
+
+- **SQL** 仍由开发者编写，MyBatis 负责把 SQL 参数化、执行并把结果映射为 Java 对象，所以它常被称作“SQL 映射框架”或半自动 ORM。
+- **Mapper 接口** 是 Java 侧调用入口；Mapper XML（或注解）提供 SQL 定义。接口方法本身通常没有实现类，运行时由 MyBatis 生成代理。
+- **JDBC** 是 MyBatis 最终使用的 Java 数据库接口；Connection、PreparedStatement、ResultSet 才负责连接、执行和读取结果。MyBatis 不绕过数据库，也不会自动优化 SQL。
+- **事务**决定一组 SQL 是否一起提交或回滚；在 Spring 中事务管理器、DataSource、SqlSessionFactory 必须指向同一数据源链路，否则“注解写了但回滚不生效”。
+- 看到“缓存”“延迟加载”“批量”时要追问作用域与触发时机：缓存是谁持有、何时清空；懒加载何时发 SQL；Batch 何时 flush。只有把这些时刻说清楚，才能解释线上表现。
+
 ## 1. MyBatis 架构与执行流程
 ### 1.1 核心原理
 **构建链路**：`SqlSessionFactoryBuilder` 读配置（mybatis-config.xml 或 Boot 的 Configuration 对象）→ `XMLConfigBuilder`/`XMLMapperBuilder` 解析出 `Configuration`（含 Environment、TypeHandlerRegistry、MapperRegistry、MappedStatement 注册表）→ `DefaultSqlSessionFactory`。
@@ -37,6 +45,19 @@
 | ResultSetHandler | 结果集映射、嵌套映射、延迟加载装配 | 每次操作新建 |
 
 **Executor 三种类型**：`SimpleExecutor`（默认，每次新建 Statement）、`ReuseExecutor`（复用同 SQL 的 Statement）、`BatchExecutor`（累积批量，需 `flushStatements` 触发）。**Spring 集成下**：`SqlSessionTemplate` 保证线程安全（内部代理 + 事务同步，把 SqlSession 绑定到 Spring 事务），所以业务代码不要自己 `openSession`，否则会脱离 Spring 事务（表现为"事务回滚了但数据还在"）。
+
+**Mapper 接口为什么能调用**：`Configuration` 的 `MapperRegistry` 记录可用 Mapper 类型；`getMapper(UserMapper.class)` 通过 `MapperProxyFactory` 创建 JDK 动态代理。代理收到 `selectById(id)` 后，`MapperProxy` 根据接口方法找到/缓存 `MapperMethod`，将方法签名映射到 `namespace + 方法名` 对应的 `MappedStatement`，再由 `MapperMethod` 根据返回类型选择 `SqlSession` 的 `selectOne`、`selectList`、`insert`、`update` 或 `delete`。因此 XML namespace、statement id、接口全限定名和方法名必须对应；常见的“Invalid bound statement”就是映射定义没有注册或 id 不匹配。
+
+**一条查询如何落到 JDBC**：
+
+1. XML 动态 SQL（例如 `<if>`、`<foreach>`）根据参数生成 `BoundSql`，其中包含 SQL 文本、ParameterMapping 列表和原始参数对象。
+2. `Executor` 先处理缓存与执行策略，然后交给 `StatementHandler` 创建 JDBC Statement。`ParameterHandler` 按 ParameterMapping 顺序调用 TypeHandler，把 Java 值写入 `PreparedStatement` 的占位符。
+3. JDBC 驱动发送 SQL；数据库返回 ResultSet 后，`ResultSetHandler` 根据 `resultType` 或 `resultMap` 创建对象、处理列与属性、嵌套映射。
+4. 返回值经 Mapper 方法返回类型适配后回到业务代码。SQL 错误、参数绑定错误、列映射错误可能发生在不同环节，排查时先看完整 SQL、参数类型，再查映射。
+
+`MappedStatement` 是解析配置时创建的相对静态元数据；`BoundSql` 是某次调用根据参数生成的动态 SQL。这个区别很重要：同一条 statement 可以因不同参数生成不同 SQL（例如动态 where 条件），而缓存键还会考虑最终 SQL 和参数等信息。
+
+`SqlSessionTemplate` 的线程安全来自“每次调用通过代理定位当前线程/事务绑定的 SqlSession”，不是把一个原生 `DefaultSqlSession` 变成线程安全对象。存在 Spring 事务同步时，同一事务里的 Mapper 操作可复用绑定的 Session；没有事务时，单次 Mapper 调用通常独立获取并关闭 Session。事务外连续两次查询不要依赖一级缓存命中。
 ### 1.2 面试问答
 **Q1：MyBatis 的执行流程？** A：SqlSessionFactory 构建 → openSession 得到 SqlSession → 通过 Executor 执行 MappedStatement → StatementHandler 创建并参数化 Statement（ParameterHandler）→ JDBC 执行 → ResultSetHandler + TypeHandler 映射结果 → 返回；过程中穿插一二级缓存查询与延迟加载处理。
 **Q2：SqlSession 是线程安全的吗？Spring 里怎么解决？** A：MyBatis 原生 SqlSession **不是线程安全的**（内部持连接与缓存，且 DefaultSqlSession 有非线程安全字段）。Spring 通过 `SqlSessionTemplate`（线程安全的代理）+ `SqlSessionInterceptor` 实现：每个操作从 `SqlSessionHolder` 获取或创建 SqlSession，并绑定到 Spring 事务，事务提交/回滚时统一关闭。手动 openSession 会脱离这套机制。
@@ -68,6 +89,10 @@ Factory → SqlSession（不安全）→ Executor → Statement/Parameter/Result
 | ResultSetHandler | handleResultSets、handleOutputParameters | 结果解密、字段脱敏 |
 
 **实现方式**：插件实现 `Interceptor`，在 `intercept(Invocation)` 里通过 `invocation.proceed()` 决定是否放行，`plugin(Object target)` 用 `Plugin.wrap` 生成 JDK 动态代理；多个插件按注册顺序层层包装（**后注册的在外层，先执行**）。**PageHelper 原理**：拦截 `Executor#query`，从 ThreadLocal 取出分页参数 → 先执行 count 查询（可用 `countSql` 优化或关闭）→ 改写 SQL 追加 `limit ?,?`（方言 Dialect 负责）→ 执行 → 清理 ThreadLocal。
+
+插件不是对任意方法的全局 AOP。`@Signature` 的 `type` 必须是 MyBatis 声明支持的目标类型之一，方法名和参数类型必须与接口/实现方法精确对应；`Plugin.wrap` 只在目标对象实现了相关接口且命中签名时才创建代理。一个四参数 `Executor#query` 与带 `CacheKey`、`BoundSql` 的六参数重载是不同拦截点，版本升级或调用路径变化可能造成插件“注册成功但从不进入”。
+
+执行器可能被层层装饰：例如开启二级缓存时得到 `CachingExecutor`，它内部仍委托基础 Executor；插件要按实际被代理的接口方法设计，而不是仅凭类名猜调用顺序。多个插件要分别验证进入顺序、改写前后 SQL、异常路径和 `finally` 清理。分页插件、租户改写插件同时存在时，分页 count SQL 是否带租户条件尤其需要测试。
 ### 2.2 面试问答
 **Q1：MyBatis 插件原理？** A：责任链 + JDK 动态代理。配置的插件在四大对象创建时被 `Plugin.wrap` 逐层包装，调用时先进入最外层插件的 `intercept`，通过 `Invocation#proceed()` 向下传递，从而在不改 MyBatis 源码的前提下增强能力。
 **Q2：PageHelper 是怎么做到分页的？** A：拦截 `Executor#query`，用 ThreadLocal 接收 `PageHelper.startPage(...)` 的参数；因为 `Page` 继承 `ArrayList`，分页信息通过返回值传递（`PageInfo` 再二次封装）；SQL 层面通过 Dialect 改写成 `limit` 并另外发一条 count 查询。**所以 PageHelper 的 count 语句性能与正确性完全取决于自动 count 改写质量**——复杂 SQL（多表 union/group by）建议手写 count。
@@ -109,6 +134,12 @@ public class CostPlugin implements Interceptor {
 | `<bind>` | 定义变量（如模糊查询拼 %） | 可复用表达式 |
 | `<sql>` + `<include>` | SQL 片段复用 | 可用 `<property>` 传参 |
 | `<selectKey>` | 主键回填（非自增/序列） | order=BEFORE/AFTER |
+
+动态 SQL 并非把 XML 文本原样拼接：MyBatis 解析 mapper 时构建 SQL 节点树；运行时 `DynamicSqlSource` 遍历节点，将满足条件的文本写入上下文并生成 `BoundSql`。`#{}` 在最终 SQL 中变成占位符，`${}` 则在构造 SQL 文本时求值替换。这个先后关系解释了为什么 `foreach` 能生成一组占位符，而 `${}` 仍需应用层保证来源可信。
+
+**动态条件必须覆盖边界输入**。例如搜索条件为空时应明确是“返回全部（并限制最大页大小）”还是“拒绝请求”；批量 `IN` 列表为空时，数据库方言可能不接受 `IN ()`，应在 Java 层短路返回空结果，或在 XML 中构造明确的恒假条件。更新 DTO 中 `null` 代表“不更新”还是“把字段清成 NULL”，必须由 API 语义决定；单靠 `<if test="x != null">` 无法表达这两种意思。
+
+更新语句应保留不可为空的主键/租户等约束，并对动态条件为空作防御。可在 Service 层先校验“至少有一个可更新字段”，不要等拼出空 `SET` 才由数据库报语法错。`<where>` 只负责裁掉开头的 AND/OR，**不会**自动保证 where 中有业务限制条件。
 ### 3.2 面试问答
 **Q1：`<where>` 和 `WHERE 1=1` 哪个好？** A：`<where>` 好：自动处理前缀 AND/OR 且无额外恒真条件，语义清晰、可读性高；`1=1` 依赖手动控制 AND，容易漏写导致语法错误，也不利于 SQL 审计。可读性与可维护性都倾向 `<where>`。
 **Q2：`<foreach>` 批量插入怎么防 SQL 过长？** A：把大列表按批切分（如每 500~1000 条一批）提交，避免超过 `max_allowed_packet` 与 SQL 解析开销；同时考虑用 `ExecutorType.BATCH`（见第 8 节）。**永远不要在 SQL 里拼接成千上万个占位符**。
@@ -157,12 +188,25 @@ public class CostPlugin implements Interceptor {
 
 ```java
 private static final Map<String, String> SORT_COLUMNS =
-        Map.of("createTime", "create_time", "amount", "amount", "id", "id");
+        createSortColumns(); // 示例中仅允许这些前端字段映射到固定列
+private static Map<String, String> createSortColumns() {
+    Map<String, String> columns = new HashMap<>();
+    columns.put("createTime", "create_time");
+    columns.put("amount", "amount");
+    columns.put("id", "id");
+    return Collections.unmodifiableMap(columns);
+}
 String column = SORT_COLUMNS.get(dto.getSortField());
 if (column == null) throw new BizException("非法排序字段");
 String direction = "desc".equalsIgnoreCase(dto.getSortOrder()) ? "DESC" : "ASC";
 // 传入 XML：ORDER BY ${column} ${direction}，两个值都来自白名单/枚举，而非用户原文
 ```
+
+`#{}` 不只是“安全字符串”：它由 `ParameterMapping` 关联 Java 类型和 TypeHandler，最终通过 `PreparedStatement#setXxx` 绑定。参数值不会成为 SQL 语法，但预编译并不意味着数据库一定复用执行计划（取决于驱动、服务器端预编译和数据库策略）。它能降低注入风险，也通常减少不同参数值造成的 SQL 文本变化。
+
+`${}` 则在 SQL 文本形成阶段做文本替换，无法用来替代参数绑定。正确的安全边界不是“只要不是引号就安全”，而是动态结构必须从有限、服务端控制的集合中产生。排序字段白名单最好将外部枚举映射到固定片段，不要只做正则过滤；表名/列名同样要验证允许值，并注意租户、分表路由不能接受任意用户字符串。
+
+即便用 `#{}`，也仍要考虑权限和语义滥用：用户传入超大分页、通配符、极宽日期范围可能造成资源耗尽；`LIKE` 中 `%`、`_` 有通配含义；数据库账号应遵守最小权限。SQL 注入防护不是单一占位符可以替代的安全设计。
 ### 4.2 面试问答
 **Q1：`#{}` 为什么能防注入？** A：因为它被编译成 `?` 占位符，参数值由 JDBC 在**语法解析之后**绑定，值永远只是数据、不会改变 SQL 结构。而 `${}` 是文本替换，参数会被当作 SQL 语法的一部分解析，因此 `' or '1'='1`、`; drop table` 之类能生效。
 **Q2：like 查询怎么写？** A：`like concat('%', #{name}, '%')`（推荐，值走占位符）或 `<bind name="pattern" value="'%' + name + '%'"/>` 后用 `#{pattern}`；**不要**写 `'%${name}%'`。注意前置 `%` 会导致索引失效，可结合全文索引/ES 处理。
@@ -196,6 +240,12 @@ String direction = "desc".equalsIgnoreCase(dto.getSortOrder()) ? "DESC" : "ASC";
 | 脏数据风险 | 中（同事务内其他途径改了库） | **高**（跨 namespace、多表联查、多实例） |
 
 **为什么不建议用二级缓存**：① 默认的 Cache 是**进程内**的，多实例部署下各实例缓存不一致；② 写操作只清理自己 namespace，联表查询或跨 Mapper 更新会产生脏数据；③ 与分布式缓存（Redis）职责重叠且更难治理；④ 一旦线上出现"数据不一致"，排查成本极高。**主流做法：缓存交给 Redis，在 Service 层显式管理 key 与失效，MyBatis 二级缓存关闭**（`mybatis.configuration.cache-enabled=false`）。
+
+缓存命中受查询语义影响，不是“相同方法名就必然命中”。一级缓存位于 Executor/SqlSession 范围；同一 Session 内相同 statement、参数、RowBounds、最终 SQL 等条件相同才有机会复用。对结果对象进行修改还可能影响缓存对象本身；MyBatis 可配置本地缓存作用域，跨 SqlSession 则不会命中一级缓存。
+
+`flushCache` 与 `useCache` 是不同控制项：写语句通常清空本地缓存；select 可选择是否使用二级缓存，`flushCache=true` 会要求清理相应缓存。二级缓存按 Mapper namespace 组织并在事务提交/关闭相关流程中维护，缓存对象可能被序列化/复制；`readOnly=true` 则意味着返回对象共享，调用方修改它有副作用。跨 Mapper 关联查询不自动建立跨 namespace 的失效关系，不能靠“数据库事务一致”推导出“缓存一致”。
+
+选择缓存时先回答：数据由谁修改、修改后如何失效、跨实例如何同步、缓存内容是否能被安全序列化、允许多长陈旧窗口。若回答不清楚，关闭 MyBatis 二级缓存通常更安全。把 Redis 缓存放在 Service 层，能让业务 key、失效策略、空值缓存与监控更显式；但仍要处理并发更新和缓存一致性。
 ### 5.2 面试问答
 **Q1：一级缓存什么时候失效？** A：① 同一个 SqlSession 内发生任何 update/insert/delete（会清空整个一级缓存，不只是相关表）；② 事务 commit/rollback；③ `flushCache=true` 的查询；④ SqlSession 关闭；⑤ `localCacheScope=STATEMENT` 时每条语句后清空。实践中最常见的是"换了 SqlSession/出了事务就没了"。
 **Q2：为什么 Spring 环境下两个 Service 方法查同一数据没有走缓存？** A：因为 Spring 把 SqlSession 绑定在**事务**上：有 `@Transactional` 时同一事务共享 SqlSession（一级缓存有效），没有事务时每次操作都新建 SqlSession，缓存自然不命中。这是"一级缓存好像没用"的标准答案。
@@ -220,7 +270,7 @@ mybatis:
 
 ## 6. 延迟加载与 N+1 问题
 ### 6.1 核心原理
-**延迟加载**：`association`/`collection` 用嵌套 select（`select="..."`）时才生效，并且需要 `lazyLoadingEnabled=true`（MyBatis 默认 false）；`fetchType="lazy|eager"` 可单条覆盖全局配置；`aggressiveLazyLoading`（3.4.1+ 默认 false，已废弃的语义）控制是否一触发就加载全部懒属性。**延迟加载依赖 SqlSession 未关闭**，所以在 Spring 中只有事务内有效——事务外访问懒属性会抛 `LazyInitializationException` 类问题或拿到 null。
+**延迟加载**：`association`/`collection` 用嵌套 select（`select="..."`）时才生效，并且需要 `lazyLoadingEnabled=true`（MyBatis 默认 false）；`fetchType="lazy|eager"` 可单条覆盖全局配置；`aggressiveLazyLoading`（3.4.1+ 默认 false，已废弃的语义）控制是否一触发就加载全部懒属性。**延迟加载依赖关联查询仍可使用 SqlSession/Executor**；Spring 默认在事务同步期间复用会话，因此应在事务内访问。事务外若会话已关闭，访问懒属性可能无法执行关联查询；OpenSessionInView 等扩展会改变生命周期，但会延长数据库会话范围，不应以此替代明确的 DTO 组装。
 
 **N+1 问题**：查 N 条主记录后，为了组装关联对象又发了 N 条（或 1 条 join 重复行）查询，总计 N+1 次数据库交互。典型来源：循环里 `mapper.selectById`、`association select` 在无延迟加载时逐条触发、ORM 的懒加载在序列化时被触发。
 
@@ -230,6 +280,12 @@ mybatis:
 | 批量 in 查询 | 先查主体，再用 `foreach` 的 in 一次查关联并内存分组 | **最常用**，避免笛卡尔积 |
 | 分页后批量装配 | 分页只查主表，再按当页 id 批量查关联 | 列表页标准做法 |
 | 延迟加载 | 开启 lazyLoadingEnabled，只在用到的字段上触发 | 关联数据用得少时，但要控制在事务内 |
+
+延迟加载实质是返回一个带拦截器的代理/集合，访问被配置为懒加载的属性时再执行关联 `select`。它只改变查询时机，并不会自动把 N+1 变成批量查询。若列表中 50 个订单的 `items` 都被序列化读取，仍可能执行 1 次主查询 + 50 次明细查询；懒加载甚至会把 SQL 隐藏到 JSON 序列化阶段。
+
+MyBatis 与 Hibernate 的 `LazyInitializationException` 语义不要混为一谈：MyBatis 懒加载需要可用的 Executor/SqlSession 执行嵌套查询，Session 已关闭后访问无法正常加载；具体异常表现取决于 MyBatis-Spring、代理与调用方式。不要依赖事务外懒对象。Web 层应显式组装 DTO/VO，控制哪些关联字段需要查询。
+
+**JOIN 与批量 IN 的取舍**：一对一/多对一通常适合 join；一对多 join 会重复主表列，且结果集可能膨胀。分页应先确定分页单位是“主记录”还是“联表行”：若按订单分页，不能先 join 出订单明细再简单 limit，否则一张订单的多行会占满页。更稳妥的套路是先分页查主键/主记录，再以该页 ID 批量查关联，最后在内存按外键分组；注意空 ID 集合、IN 参数上限和排序稳定性。
 
 ### 6.2 面试问答
 **Q1：什么是 N+1 问题？怎么发现？** A：一次列表查询 + N 次明细查询 = N+1 次交互，数据库往返次数与数据量线性增长。发现方式：打开 SQL 日志看同一模板的重复执行次数、APM（SkyWalking）里的"同一 SQL 高频调用"、`/actuator/metrics` 中连接池与 DB 指标异常。
@@ -250,10 +306,10 @@ mybatis:
 // 反例：循环内查库 → N+1
 for (Order o : orders) { o.setItems(itemMapper.selectByOrderId(o.getId())); }
 // 正例：批量 in 一次查询后内存分组
-List<Long> ids = orders.stream().map(Order::getId).toList();
+List<Long> ids = orders.stream().map(Order::getId).collect(Collectors.toList());
 Map<Long, List<Item>> grouped = itemMapper.selectByOrderIds(ids).stream()
         .collect(Collectors.groupingBy(Item::getOrderId));
-orders.forEach(o -> o.setItems(grouped.getOrDefault(o.getId(), List.of())));
+orders.forEach(o -> o.setItems(grouped.getOrDefault(o.getId(), Collections.emptyList())));
 ```
 ### 6.5 一句话速记
 延迟加载需 lazyLoadingEnabled 且必须在事务内；列表页用"主表分页 + 批量 in 装配"消灭 N+1。
@@ -265,6 +321,12 @@ orders.forEach(o -> o.setItems(grouped.getOrDefault(o.getId(), List.of())));
 **自定义 TypeHandler**：实现 `TypeHandler<T>`（或继承 `BaseTypeHandler<T>`）并通过 `@MappedTypes`/`@MappedJdbcTypes` 声明，或在 XML 的 `typeHandler` 属性上指定、或全局注册 `type-handlers-package`。典型用途：枚举 ↔ DB 值转换、JSON 字段 ↔ 对象、加密字段自动加解密。
 
 **主键回填**：自增主键用 `useGeneratedKeys="true" keyProperty="id"`；非自增（序列/UUID）用 `<selectKey order="BEFORE" resultType="long">select seq.nextval from dual</selectKey>`；批量插入时 `keyProperty` 指向集合内对象的 id。
+
+`resultType` 适合列名与属性名简单对应的扁平结果；`resultMap` 用于显式列映射、关联对象、集合、复合主键和特殊 TypeHandler。嵌套映射时 `<id>` 标识对象身份，帮助 MyBatis 去重合并重复行；忘记写 `<id>` 可能让一对多 join 每行都产生重复父对象。联表列尽量显式别名（如 `u.id AS user_id`、`o.id AS order_id`），避免同名列映射歧义。
+
+TypeHandler 在“Java 值 ↔ JDBC 值”边界工作：写入时设置占位符，读取时按 JDBC 类型取值。枚举持久化应使用稳定业务 code 而不是 ordinal；新增枚举项或调整声明顺序不应改写历史含义。对数据库 NULL 使用 `getInt` 等基本类型读取时要留意 JDBC 的 null 语义，可用 `wasNull()` 或可空类型映射，避免把 NULL 误读成 0。
+
+生成主键回填依赖 JDBC 驱动与数据库能力；`useGeneratedKeys` 并不保证所有数据库、批处理模式或中间件都支持。应针对实际驱动版本做集成测试，验证插入后实体 ID、影响行数和回滚行为。非自增键若由应用生成（UUID/雪花 ID），通常可在 insert 前赋值，减少对数据库返回键能力的依赖。
 ### 7.2 面试问答
 **Q1：结果集映射不上/字段为 null 怎么排查？** A：① 检查列名与属性名（下划线转驼峰是否开启）；② 是否用了 resultMap 且漏配字段；③ 列别名与属性不匹配（`select a.name as name`）；④ 用了 `PARTIAL` 自动映射但字段在嵌套 resultMap 里（不会自动映射）；⑤ 类型不匹配（枚举/日期）。最稳的做法是显式 resultMap，或用 `resultType` + 别名。
 **Q2：枚举怎么优雅映射？** A：默认 `EnumTypeHandler` 存 name 字符串，`EnumOrdinalTypeHandler` 存序数（**不要用序数，顺序一变数据就错**）。推荐自定义 TypeHandler 按业务 code 存取（如 `StatusEnum.of(code)`），DB 存 int/varchar 都一致；MyBatis-Plus 还提供 `IEnum` 接口简化这一过程。
@@ -304,6 +366,16 @@ public class StatusEnumTypeHandler extends BaseTypeHandler<StatusEnum> {
 
 **实践要点**：① 大批量插入按 500~1000 条切批，批与批之间可提交（注意事务粒度）；② 批量插入时**不要**在 SQL 里做 `ON DUPLICATE KEY UPDATE` 之外的重逻辑；③ MySQL 的 `max_allowed_packet`、`innodb_buffer_pool_size`、`log_bin` 都会影响批量写入速度；④ 导入类场景考虑 `LOAD DATA INFILE`；⑤ 批量更新比批量插入更容易踩坑（无 where 的 update 会放大锁范围），优先按主键分批更新。
 **性能对比结论（经验值，需实测）**：单条循环插入最慢；foreach 多值插入与 JDBC batch 相近，前者受包大小限制、后者受出参/回滚粒度影响；开启 `rewriteBatchedStatements` 后 batch 提升通常最明显。
+
+**三种“批量”不要混淆**：
+
+- `foreach` 多值 INSERT 是一条 SQL，数据库看到一条 statement 和大量 value tuple；它的占位符数、报文大小、SQL 解析成本都会随行数增长。
+- `ExecutorType.BATCH` 是 JDBC `addBatch`/`executeBatch` 模式。同一批中重复执行同一 MappedStatement 会累积参数组，达到 flush 时才送往驱动；执行前未 flush，后续查询可能触发隐式 flush，时机不应靠猜。
+- 循环单条执行即使放在同一事务，也仍然可能有大量数据库往返；事务只减少提交边界成本，不会自动把 SQL 合并。
+
+Spring 下若要使用 Batch Executor，应为该批处理明确配置独立的 `SqlSessionTemplate`/事务边界，避免在同一事务里混用不同 ExecutorType 的 SqlSession。批处理中途要定期 flush 并处理 `BatchResult`；flush 不等于 commit，异常仍应由事务回滚。分批提交会形成多个事务，需接受部分批次已成功、后续批次失败的恢复语义。
+
+批次大小不是固定答案。需实测驱动参数（如 MySQL Connector/J 的 `rewriteBatchedStatements`）、每行列数、索引数量、网络报文限制、事务日志与锁等待。生成键、每行不同 SQL、触发器与冲突更新都可能改变驱动批处理收益；上线前以实际驱动版本和数据库版本做压测。
 ### 8.2 面试问答
 **Q1：foreach 批量插入和 ExecutorType.BATCH 有什么区别？** A：foreach 在 SQL 层合并成一条多值 INSERT（网络往返一次，但 SQL 巨大且受包限制）；BATCH 在 JDBC 层累积多条语句后一次性发送（不拼大 SQL，但驱动需支持批量重写，且影响行数/自增主键回填受限）。**结论：常规业务用 foreach 分批（简单直观）；超大批量导入用 BATCH + rewriteBatchedStatements，并用压测确认。**
 **Q2：批量插入为什么有时很慢？** A：① 每条都自动提交（未包事务）→ 每条一次 fsync；② 未开启 `rewriteBatchedStatements`；③ 唯一索引/主键冲突检查开销；④ binlog 同步（`sync_binlog=1`）；⑤ 分批过大导致大事务（undo 膨胀、锁等待）。按这个顺序排查。
@@ -335,6 +407,12 @@ jdbc:mysql://127.0.0.1:3306/db?rewriteBatchedStatements=true&useServerPrepStmts=
 **多数据源**：每个数据源一套 `DataSource + SqlSessionFactory + SqlSessionTemplate + MapperScannerConfigurer`，在 `@MapperScan(basePackages="com.x.a.mapper", sqlSessionTemplateRef="aSqlSessionTemplate")` 里区分（**注意 Mapper 包必须互斥**，同一包不能被两个 `@MapperScan` 扫到）。
 
 **动态数据源**：`AbstractRoutingDataSource#determineCurrentLookupKey` 返回 ThreadLocal 中的数据源 key，用 AOP 在方法/类上切换（`@DS("slave")` 思路）。**两个必须注意的坑**：① 数据源切换必须发生在**获取连接之前**，若外层已开启事务，连接已绑定，切换无效——需要 `LazyConnectionDataSourceProxy` 延迟获取连接；② ThreadLocal 要清理，避免线程池复用时串库。
+
+整合时的对象关系要保持一致：Mapper 代理绑定到某个 `SqlSessionTemplate`；Template 绑定到某个 `SqlSessionFactory`；Factory 使用某个 `DataSource`。事务管理器也必须管理这条 DataSource 链路。多数据源下显式给每个 Mapper 包绑定 Template/Factory，避免自动配置猜错默认 Bean。若存在多个 `DataSource`，`@Primary` 只帮助默认注入选择，不能替代 Mapper 扫描边界和事务管理器的明确配置。
+
+事务切面与数据源路由切面的顺序要按真实 AOP 调用链验证，而非只看注解上的 `@Order` 数值。路由 key 应在事务获取连接前设置，方法返回或异常后都必须清理；异步任务不会自动继承 ThreadLocal。对只读事务、连接池代理、`LazyConnectionDataSourceProxy` 的组合要做集成测试，因为连接可能在事务开始时延迟到第一次 SQL 才真正取得。
+
+读写分离还要区分“路由正确”和“数据新鲜”：主从复制是异步时，写后立即读从库可能读到旧数据。常见做法是在写事务期间或短时间窗口强制走主库；这属于业务一致性策略，不是 `@Transactional(readOnly=true)` 自动能解决的问题。
 ### 9.2 面试问答
 **Q1：动态数据源切换为什么有时不生效？** A：因为连接在事务开始时就已经从 DataSource 获取并绑定到事务上下文，之后改 ThreadLocal 的 key 不会改变已有连接。解决：用 `LazyConnectionDataSourceProxy` 包装目标数据源（真正执行 SQL 时才取连接），并确保 AOP 切面在事务切面**外层**执行（@Order 顺位更靠前）。
 **Q2：读写分离怎么做？** A：常见三件套：`AbstractRoutingDataSource` + AOP（按方法名/getter 判断读写）+ 强制走主的注解（如 `@Master`）；配合主从复制延迟，**写后立即读的业务必须强制走主库**，否则出现"刚下单查不到"；强一致场景不要做读写分离。也可用 ShardingSphere-JDBC 的读写分离功能替代自研。
@@ -382,6 +460,14 @@ public class DataSourceAspect {
 | SQL 注入器 | 实现 `ISqlInjector`/`AbstractMethod` | 自定义通用方法（如 insertIgnore） |
 
 **插件注册顺序（关键）**：多租户 → 动态表名 → 分页 → 乐观锁 → 防全表更新删除（官方建议的分页插件放后面的思路是"分页最后改写 SQL"；具体顺序以官方文档为准，顺序错误会出现分页失效或租户条件丢失）。
+
+MyBatis-Plus 是建立在 MyBatis 之上的增强层，不改变 JDBC、事务或 SQL 的基本规则。`BaseMapper` 为常见单表 CRUD 提供通用 SQL；Wrapper 将条件构造为 SQL 片段；复杂查询、窗口函数、报表、数据库特有语法仍适合写清晰的 Mapper XML。通用方法减少重复代码，但生成 SQL 仍应通过日志或 SQL 分析工具观察。
+
+**分页版本与依赖提示**：需要显式注册 `MybatisPlusInterceptor` 并添加 `PaginationInnerInterceptor`。MyBatis-Plus 3.5.9 起分页相关解析器依赖拆分，按对应版本文档补充 `mybatis-plus-jsqlparser` 等依赖；升级时检查依赖树，不要只复制旧版配置。多数据源项目要确认分页插件注册在实际 Mapper 使用的每个 `SqlSessionFactory` 上。自动 count 可能被优化或关闭，`total` 不是无需验证的常量。
+
+Wrapper 中传入的列名与 SQL 片段仍需审视：Lambda Wrapper 降低字段拼写错误，但 `last()` 接收原始 SQL 片段，`apply()` 的占位符使用错误也可能引入注入风险。逻辑删除和租户插件对框架生成 SQL 的改写，不自动保证所有手写 XML、存储过程和其他数据访问方式都遵守同样的过滤规则。
+
+**插件顺序应按 SQL 变换而测试**：不同版本与插件组合的官方建议可能变化，不能把某个固定顺序当成通用定理。至少覆盖：分页 count SQL 是否保留租户条件、动态表名是否应用到 count、乐观锁更新是否带版本 where、无 where 更新是否被拦截；捕获最终 SQL 做断言。拦截器也不是数据库权限边界，关键表仍需最小权限和审计。
 ### 10.2 面试问答
 **Q1：MP 的分页插件为什么不生效？** A：最常见是**忘记注册 `MybatisPlusInterceptor` 并 addInnerInterceptor(new PaginationInnerInterceptor(...))`**；其次是多数据源下插件注册到了另一个 SqlSessionFactory；再次是自定义 XML 里手写了 limit 或用了 `last("limit ...")` 造成双重分页。另外 `IPage` 的 total 为 0 时检查 count SQL 是否被关闭或 count 语句被优化没了。
 **Q2：逻辑删除的坑有哪些？** A：① 唯一索引与逻辑删除冲突（删除后同 key 无法再插入）——需把 `deleted` 纳入唯一索引或改用"删除时改写 key"；② 原生 XML 手写 SQL 不会自动加 `deleted=0`，容易查到已删数据；③ 与 MP 的 `selectById` 一致但与其他框架/中间件不一致；④ 数据量膨胀需要归档。
@@ -423,6 +509,10 @@ MP = BaseMapper + Wrapper + 插件（分页/乐观锁/多租户/防全表）；�
 **选型结论**：互联网业务以"SQL 可控 + 复杂查询 + 性能可预测"为优先，选 MyBatis（+MP）；领域模型复杂、数据库尽量中立的场景可选 JPA。**面试表达要点：不是好坏之分，而是团队能力与业务形态的匹配；同时要能说出 JPA 的 N+1、懒加载、一级缓存坑与 MyBatis 的 SQL 维护成本。**
 
 **SQL 监控与治理**：① 日志打印——MyBatis 的 `log-impl`（StdOutImpl/Slf4jImpl）或 `logging.level.com.x.mapper=debug`；② p6spy/`log4jdbc` 打印带参数的完整 SQL 与耗时；③ Druid 的 StatFilter 慢 SQL 统计；④ MySQL 慢查询日志（`slow_query_log`、`long_query_time`、`pt-query-digest`）；⑤ APM（SkyWalking/Pinpoint）看调用链与慢 SQL 关联；⑥ 线上诊断用 Arthas（`watch`/`trace`/`tt`）。**规范：ORM 层必须有慢 SQL 阈值与上报，不能依赖"出问题再看日志"。**
+
+一个可执行的慢 SQL 排查闭环是：从请求/APM 找到 Mapper statement id 和耗时 → 确认实际 SQL、参数分布、返回行数 → 在目标数据库用 `EXPLAIN`/执行计划确认访问路径与估算行数 → 检查索引选择性、排序/回表/临时表、锁等待 → 调整 SQL 或索引 → 用代表性数据和参数重新测量 → 观察线上慢查询比例及副作用。不要把日志中的“SQL 文本看起来简单”当作执行快，也不要在生产直接对高成本查询运行会实际执行的分析命令而不评估影响。
+
+分页本身也有数据规模边界：`LIMIT offset, size` 在深页时通常仍要扫描/跳过大量记录。若业务排序稳定且有单调键，可采用 keyset/游标分页（例如 `where id > #{lastId} order by id limit #{size}`）；它不适用于任意跳页，且游标字段需要与排序规则匹配。总数只在产品确实需要时计算，复杂联表的 count 应单独设计。
 ### 11.2 面试问答
 **Q1：MyBatis 最常见的事故是什么？** A：**漏写 where 条件的全表更新/删除**（动态 SQL 全为 null），其次是 `ORDER BY ${}` 的注入、N+1 拖垮数据库、大事务批量插入导致主从延迟。防御组合：`BlockAttackInnerInterceptor` + 白名单排序参数 + 循环内禁查库的规范 + 分批提交。
 **Q2：分页 count 为什么会慢？** A：PageHelper/MP 的自动 count 会把原 SQL 改写成 `select count(*) from (...)`，若 SQL 含 `group by`、多表 join、`distinct`、子查询，count 代价可能比数据查询更高；某些 SQL 还会被改错（丢条件或多算）。解法：复杂分页手写 count、只对主表 count（`count(*) from t_order where ...` 与联表结果行数一致的场景）、加合适索引、必要时改用"游标/滚动分页"（`where id > lastId limit N`）替代深分页。

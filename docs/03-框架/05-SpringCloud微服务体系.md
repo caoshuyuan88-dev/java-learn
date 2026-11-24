@@ -2,7 +2,7 @@
 
 > **定位**：把注册发现、配置中心、负载均衡、服务调用、熔断限流、网关、链路追踪与服务治理串成一条完整链路，并讲清版本对齐这个最大的工程坑。
 > **重要度**：★★★★★（中大型互联网公司后端岗高频，网关与熔断限流是必问）
-> **建议复习时长**：6~8 小时（建议搭一套 Nacos + Gateway + Feign + Sentinel 的最小集群）
+> **建议复习时长**：6~8 小时（可搭一套 Nacos + Gateway + Feign + Sentinel 做实验；这是示例组合，不代表所有项目都必须使用这些组件）
 > **关联文档**：[Spring Boot 与自动装配](./02-SpringBoot与自动装配.md)、[Spring MVC 与 Web 容器](./03-SpringMVC与Web容器.md)、[Nginx 与网关限流](../04-中间件/05-Nginx与网关限流.md)、[分布式事务](../05-分布式与架构/02-分布式事务.md)、[高并发高可用架构设计](../05-分布式与架构/04-高并发高可用架构设计.md)、[CI/CD 与监控告警](../07-工程化与DevOps/03-CICD与监控告警.md)
 
 ## 0. 知识地图
@@ -26,6 +26,10 @@
 **单体到微服务的演进路径**：单体 → 模块化单体（清晰包边界）→ 服务拆分（按业务能力/领域）。**拆分原则**：① **单一职责与高内聚**（一个服务只做一件事，改动原因唯一）；② **DDD 限界上下文**（聚合根与一致性边界决定服务边界，跨上下文用事件/接口而非直接改库）；③ **按业务能力/组织架构拆分**（康威定律：架构会向组织结构收敛）；④ **数据私有**（每个服务独占库/schema，禁止跨服务直连数据库）；⑤ **调用链与事务边界尽量短**（避免长事务跨服务）。
 
 **拆分的代价**：分布式事务、跨服务查询（需数据聚合/冗余）、链式调用放大故障、运维与排障成本、测试成本、网络延迟。**判断标准**：团队规模、发布频率、性能与扩容需求、故障隔离要求。**结论：拆得过细比不拆更糟**，"分布式单体"（服务拆了但强耦合、必须一起发布）是常见的失败案例。
+
+**先理解“服务”与“微服务”**：服务是有独立边界、接口和运行生命周期的进程；“微”不是按代码行数或表数量定义，而是强调边界清晰、可独立交付和治理。一次普通调用可能变成 `客户端 -> Gateway -> order-service -> inventory-service -> 数据库`，每个跨进程箭头都增加网络延迟、序列化、超时和失败概率。把单体拆成多个进程不会自动提高性能；只有当独立扩容、并行开发或隔离故障的收益超过网络、数据一致性、部署和观测成本时，拆分才划算。
+
+**Spring Cloud 是能力集合，不是强制架构清单**：它提供若干可组合的抽象和集成（如服务发现、客户端负载均衡、网关、断路器、配置），并不要求每个系统都必须采用注册中心、Feign、Nacos、Sentinel 全家桶。Kubernetes DNS/Service、云厂商网关、Service Mesh、HTTP 客户端或平台配置服务也可承担相同职责。先识别问题与运行平台，再选择一套职责清晰、避免重复治理的组件。
 ### 1.2 面试问答
 **Q1：微服务拆分的粒度怎么定？** A：从"改动频率高、需要独立扩容、团队归属不同"的地方先拆；一个服务由一个小团队（2 pizza team）能完整负责；边界与限界上下文一致；避免"贫血服务"（只有一个 CRUD 方法）。粒度过细的标志：一次业务改动要跨 5 个以上服务、服务间调用链超过 4 层。
 **Q2：为什么禁止服务间共享数据库？** A：共享库会让服务退化成"分布式单体"（表结构改动耦合、无法独立部署）、破坏封装、让分布式事务无法回避。正确做法是服务暴露能力接口，数据通过 API/事件同步（冗余读模型是常规代价）。
@@ -52,10 +56,14 @@ Spring Cloud 采用**版本列车（release train）+ 年份版本号**，每个
 | 2020.0 (Ilford) | 2.4.x / 2.5.x | **移除 Ribbon**，改用 Spring Cloud LoadBalancer；引入 Spring Cloud CircuitBreaker 抽象 |
 | 2021.0 (Jubilee) | 2.6.x / 2.7.x | 与 Boot 2.6 的循环依赖/路径匹配变化同步 |
 | 2022.0 (Kilburn) | 3.0.x / 3.1.x | 对应 Spring 6 + jakarta，Sleuth 被 Micrometer Tracing 取代 |
-| 2023.0 (Leyton) | 3.2.x / 3.3.x | 继续在 Boot 3.x 上迭代，Gateway 服务化/虚拟线程等演进 |
-| 2024.0 | 3.4.x / 3.5.x | 以官方版本对应表为准 |
+| 2023.0 (Leyton) | 3.2.x；从 2023.0.2 起支持 3.3.x | Boot 3.x 时代的组件列车 |
+| 2024.0 (Moorgate) | 3.4.x | Boot 3.4 对应列车 |
+| 2025.0 (Northfields) | 3.5.x | Boot 3.5 对应列车 |
+| 2025.1 (Oakwood) | 4.0.x | Boot 4.0 对应列车；具体组件以该 train 的 BOM 为准 |
 
-**Spring Cloud Alibaba 对应关系（以官方发布说明为准）**：2.2.x 系列对应 Spring Cloud Hoxton + Boot 2.3.x；2021.0.x 系列对应 Spring Cloud 2021.0.x + Boot 2.6.x；2022.0.x 系列对应 Spring Cloud 2022.0.x + Boot 3.0/3.1；2023.0.x 系列对应 Spring Cloud 2023.0.x + Boot 3.2+。**引入方式**用 `spring-cloud-dependencies` 与 `spring-cloud-alibaba-dependencies` 的 BOM 统一管理版本。
+**版本信息的边界**：上表是 Spring Cloud 官方支持矩阵中的主要对应关系，不等于每个补丁版本都能任意混用；例如 2023.0.x 对 Boot 3.3.x 的支持始于特定补丁版本。Spring Cloud Alibaba（SCA）有自己的发布列车和组件矩阵，必须核对所选 SCA 版本、Spring Cloud train、Boot 版本、Nacos 服务端/客户端的官方兼容说明，不能仅按相同年份号推断兼容。引入方式通常使用 `spring-cloud-dependencies` 与匹配版本的 `spring-cloud-alibaba-dependencies` BOM，具体 artifact 和支持范围以官方发布说明为准。
+
+**怎么理解版本列车**：Spring Boot 管理 Spring Framework、Servlet 容器等基础设施；Spring Cloud 再基于 Boot 提供服务注册、配置、网关和调用等组件。列车 BOM 的作用是将一组经过协同测试的 Cloud 组件版本作为整体管理，不是一个独立的 Spring Boot 版本。使用时先选 Boot 主次版本，再查对应 Cloud train，最后查 SCA/Nacos 等第三方生态；不要先从博客复制一个组件版本再反向拼依赖。官方支持矩阵会随生命周期更新，升级前以 [Spring Cloud Supported Versions](https://github.com/spring-cloud/spring-cloud-release/wiki/Supported-Versions) 与组件各自文档为准。
 
 **版本不对齐的典型症状**：`NoSuchMethodError`、`NoClassDefFoundError`、`AbstractMethodError`、Gateway 启动报 Netty 版本冲突、Feign 编解码类找不到、Nacos 注册成功但配置不生效。**排查手段**：`mvn dependency:tree` 看 Boot/Cloud/Netty/Jackson 的实际版本，用 BOM 收敛而不是逐个指定版本。
 ### 2.2 面试问答
@@ -97,6 +105,10 @@ Cloud 是版本列车：Hoxton→2020.0→2021.0→2022.0→2023.0 分别对应 
 **Eureka 自我保护机制**：当最近一分钟实际收到的续约数低于阈值（`renewal-percent-threshold` 默认 0.85，窗口 `renewal-threshold-update-interval-ms` 默认 15 分钟）时，Eureka 认为"可能是自己网络问题"而不是服务大面积挂掉，于是**停止剔除过期实例**，保护消费者不因误剔除而无法调用。副作用是"服务明明挂了却还能被调用到"（返回连接拒绝），所以排查时要注意区分"真挂"与"自我保护"。可通过 `eureka.server.enable-self-preservation=false` 关闭（一般不建议在生产关闭）。
 
 **Nacos 的 AP/CP 切换**：注册的实例分为**临时实例**（默认，`ephemeral=true`，客户端心跳 + Distro 协议，保证可用性与最终一致）与**持久实例**（`ephemeral=false`，服务端健康检查 + Raft，强一致）；**不是整个集群切换 AP/CP，而是按实例类型选择一致性模型**——这是常见的面试误解点。
+
+**为什么消费者缓存实例列表**：注册发现不是每次 RPC 都先问中心“地址是什么”。客户端启动时订阅某服务的实例列表，注册中心推送或客户端定期拉取变更，客户端本地缓存后由负载均衡器选实例。这样调用路径更短，也避免注册中心成为每次业务请求的瓶颈；代价是视图短暂不一致，所以刚下线的实例可能仍被调用。优雅下线应先摘流量，再等待订阅与负载均衡缓存传播，最后停止进程。
+
+**注册中心只解决地址与健康视图，不保证调用成功**：实例“健康”不等于业务接口可用，心跳也不等于端到端探测。消费者仍必须配置连接/读取超时、错误处理、限流与有界重试。网络分区时提供者、消费者与注册中心可能持有不同视图；服务发现本身不提供数据一致性、鉴权，也不自动完成负载均衡。注册中心的 namespace、group、cluster 和实例元数据常用于隔离环境、逻辑服务组与机房，但含义及默认值依产品配置而异。
 ### 3.2 面试问答
 **Q1：注册中心的作用与核心机制？** A：解耦服务提供者与消费者的地址依赖，提供注册、发现、健康检查、变更通知。机制是"客户端注册 + 心跳续约 + 本地缓存 + 变更推送 + 负载均衡选实例"，消费者不每次调注册中心（否则注册中心是单点与瓶颈），而是本地缓存 + 事件刷新。
 **Q2：Eureka 的自我保护要开还是关？** A：默认开、生产一般保持开启，因为它的初衷是抵御网络分区导致的误剔除（AP 取向）；但要配合监控告警（自我保护触发是重要故障信号），并清楚"可能调用到已死实例"的副作用（靠客户端快速失败 + 重试兜底）。测试环境可关闭以获得更快的实例摘除。
@@ -113,20 +125,25 @@ spring:
     nacos:
       discovery:
         server-addr: 127.0.0.1:8848
-        namespace: prod
+        namespace: prod-namespace-id   # 许多版本要求填 namespace ID，而非控制台显示名
         ephemeral: true          # 临时实例：心跳 + AP
         metadata: { version: v1 }   # 灰度发布常用元数据
 ```
+该 YAML 展示常见属性形态；SCA 与 Nacos 客户端版本不同，属性名、namespace 填值和默认行为可能变化。示例中的注册地址为本机开发环境，生产应配置集群地址、认证信息与网络隔离。
 ### 3.5 一句话速记
 注册中心 = 注册 + 心跳 + 本地缓存 + 变更推送；Eureka 是 AP 且有自我保护，Nacos 按临时/持久实例分别走 AP/CP。
 
 ## 4. 配置中心与动态刷新
 ### 4.1 核心原理
-**Nacos 配置模型**：`namespace`（环境/租户隔离，如 dev/test/prod）→ `group`（业务/项目分组）→ `dataId`（具体配置，通常为 `${spring.application.name}-${profile}.${file-extension}`，如 `order-service-prod.yaml`）。多配置合并有优先级：主配置（`spring.cloud.nacos.config.*`）> 扩展配置 `extension-configs` > 共享配置 `shared-configs`，数组下标越大优先级越高（以官方文档为准）。
+**Nacos 配置模型**：`namespace`（环境/租户隔离，如 dev/test/prod）→ `group`（业务/项目分组）→ `dataId`（具体配置，通常为 `${spring.application.name}-${profile}.${file-extension}`，如 `order-service-prod.yaml`）。多配置合并有优先级：主配置（`spring.cloud.nacos.config.*`）> 扩展配置 `extension-configs` > 共享配置 `shared-configs`，数组下标越大优先级越高——**此顺序和属性键会随 SCA/客户端版本变化，必须以所用版本官方文档为准，并通过启动日志或 `/actuator/env` 确认最终值**。
 
 **动态刷新原理**：Nacos 客户端用**长轮询**（客户端发起请求最长挂起约 30s，服务端有变更立即返回）监听配置变化 → 变更后发布 `RefreshEvent` → 容器刷新带 `@RefreshScope` 的 Bean（销毁并重建代理的目标对象）→ 同时刷新已绑定的 `@ConfigurationProperties`。**注意：不是所有 Bean 都会刷新，只有 `@RefreshScope`（或 `@ConfigurationProperties` 且位于刷新范围内）才会。**
 
 **动态刷新的坑**：① 普通 Bean 里 `@Value` 注入的值不会更新（Bean 没被重建）；② 静态字段/`static final` 常量不刷新；③ 在 `@PostConstruct` 里读取的配置只在启动时生效；④ 线程池、连接池等已初始化资源不会因为属性变化而重建（需要监听事件手动处理）；⑤ `@RefreshScope` 的 Bean 是代理，**首次访问才创建**，若构造很重会导致首次请求变慢；⑥ 与 `@Scheduled`/`@Async` 结合时要用 `@RefreshScope` 或重建线程池；⑦ 刷新风暴：大批实例同时监听同一 dataId，发布时注意分批与灰度。
+
+**配置变更的完整链路**：运维或发布系统提交新配置 -> 配置中心鉴权、保存版本并通知客户端 -> 客户端获取变更并更新 Environment/绑定对象 -> 应用中的刷新监听器重建或重绑相关 Bean -> 新请求使用新值。每一步都可能失败，因而生产配置要有版本记录、审计、审批、回滚、变更通知和实例生效状态观测。多项相互依赖的配置不要假定所有实例在同一瞬间原子切换；可通过兼容式双配置、分批发布和灰度验证降低短暂版本不一致的风险。
+
+**哪些配置不应随意动态改**：阈值、开关、文案等可刷新配置较容易处理；数据库连接池大小、线程池、服务监听端口、序列化格式等资源型/启动型配置往往需要显式重建，甚至滚动重启。把密钥放配置中心并不自动安全，还要做访问控制、加密、脱敏、轮换和审计。应用应有可工作的本地默认配置或明确的启动失败策略，避免配置中心失联时每个实例行为不可预测。
 ### 4.2 面试问答
 **Q1：配置中心怎么实现动态刷新？** A：客户端长轮询（或推送通道）监听变更 → 收到变更后拉取新配置 → 更新 Environment 中的 PropertySource → 发布 RefreshEvent → 由 `RefreshScope` 重建作用域内 Bean、由 ConfigurationPropertiesRebinder 重新绑定属性。所以"刷新"本质是"重建 Bean + 重绑属性"，而不是原地修改字段。
 **Q2：为什么 `@Value` 有时不刷新？** A：因为 `@Value` 是在 Bean 创建时解析并写入字段的，配置刷新后如果该 Bean 不在 `@RefreshScope` 内就不会被重建，字段仍是旧值。解法：Bean 上加 `@RefreshScope`，或改用 `@ConfigurationProperties`（支持 rebinder），或从 `Environment` 每次读取（不推荐）。
@@ -159,6 +176,10 @@ Nacos 模型 namespace > group > dataId，动态刷新靠长轮询 + RefreshEven
 | 缺点 | 每语言都要实现、实例变更需刷新缓存 | 多一跳、动态感知较弱 |
 
 **Ribbon 已停止维护**：Spring Cloud 2020.0（Ilford）起移除 Ribbon，统一用 **Spring Cloud LoadBalancer**（`spring-cloud-starter-loadbalancer`）。**常见策略**：`RoundRobinLoadBalancer`（默认轮询）、`RandomLoadBalancer`（随机）、`NacosLoadBalancer`（Nacos 权重/同集群优先，SCA 提供）；可自定义 `ReactorServiceInstanceLoadBalancer` 或实现 `ServiceInstanceListSupplier` 做灰度/同机房优先。缓存：默认缓存实例列表（`spring.cloud.loadbalancer.cache.ttl`，可配置）；健康检查可通过 `spring.cloud.loadbalancer.health-check.*` 开启主动检查。
+
+**负载均衡做什么、不做什么**：它从可用实例集合中选一个目标，然后把请求发给该实例；默认轮询/随机并不等于根据 CPU、响应时间或业务容量智能选节点。实例过滤（健康、zone、版本、灰度）、选取策略、重试和连接池是不同环节，不能把它们混为“负载均衡自动解决高可用”。多实例仍需探活、超时、连接失败处理和容量规划；如果注册中心/实例缓存短暂过期，选到失效地址仍可能失败。
+
+**客户端与服务端方案的运行代价**：客户端负载均衡要求每个调用方持有实例列表并实现一致的选择行为；服务端代理让所有调用集中经过代理，策略集中但多一跳且代理需高可用。许多平台还会由 Kubernetes Service 或 Service Mesh 提供发现与转发；不要同时叠加多个客户端/代理层而不明确每层的职责，否则会出现两次选址、重试次数放大和排障困难。
 ### 5.2 面试问答
 **Q1：客户端负载均衡的原理？** A：调用方从 `ServiceInstanceListSupplier` 拿到实例列表（来自注册中心并本地缓存）→ 按策略选出实例 → 直接发 HTTP 请求；框架（Feign/RestTemplate）通过 `@LoadBalanced` 拦截器把服务名替换为真实 host:port。**没有中间代理，少一跳**，但每个实例都要有自己的负载策略与缓存。
 **Q2：为什么 Ribbon 被替换？** A：Ribbon 长期处于维护模式、与 Reactor/WebClient 的异步模型不匹配、且 Netflix 组件整体退场（Hystrix/Archaius/Zuul 同样）。Spring Cloud LoadBalancer 是官方基于 Reactor 的实现，与 Gateway、WebClient、Feign 一致。
@@ -173,11 +194,9 @@ Nacos 模型 namespace > group > dataId，动态刷新靠长轮询 + RefreshEven
 public class LbConfig {
     @Bean @LoadBalanced
     public RestTemplate restTemplate() { return new RestTemplate(); }   // 支持 http://order-service/...
-    @Bean public ReactorLoadBalancer<ServiceInstance> grayLb(LoadBalancerClientFactory f) {
-        return new GrayLoadBalancer(f);     // 自定义灰度策略（按元数据/标头过滤）
-    }
 }
 ```
+`@LoadBalanced` 的拦截器只作用于这个 Spring Bean；普通 `new RestTemplate()` 不会自动把服务名解析为实例。生产代码应复用配置好的 HTTP 客户端，设置连接池、连接/读取超时，并根据所用 Cloud 版本接入对应 LoadBalancer starter。自定义灰度选择器需要实现 Spring Cloud LoadBalancer 扩展接口，不是上例中能直接复制的一个类。
 ```yaml
 spring: { cloud: { loadbalancer: { cache: { ttl: 10s } } } }   # 缩短缓存，降低下线实例被调用窗口
 ```
@@ -188,21 +207,28 @@ Spring Cloud 用客户端负载均衡（Ribbon → LoadBalancer）：本地实�
 ### 6.1 核心原理
 **Feign 原理**：`@FeignClient` 接口在启动时被扫描（`@EnableFeignClients` + `FeignClientFactoryBean`）→ 为每个接口生成 **JDK 动态代理** → 调用时由 `Contract` 解析注解得到方法元数据 → `RequestTemplate` 构造请求（编码器 `Encoder` 序列化参数）→ 通过 `Client`（默认 `LoadBalancerFeignClient`）用负载均衡选择实例并发送 → 响应由 `Decoder` 反序列化 → 返回。
 
+**Feign 调用并非 Java 本地调用**：接口代理把方法参数转换成 HTTP 请求，网络序列化、DNS/服务发现、连接池、远端超时、错误状态码和版本兼容仍然存在。OpenFeign 与 Spring Cloud LoadBalancer 的集成通常需要引入对应 LoadBalancer starter；若没有该集成或没有注册发现能力，不能仅凭 `@FeignClient(name="...")` 就假设服务名一定能被解析。也可以把 `url` 指向固定地址，但这会绕过按服务名发现实例的流程。
+
+**同步调用还是消息协作**：Feign/WebClient 等同步 HTTP 调用适合需要立即得到结果、调用链短且有明确超时预算的查询或命令；消息队列适合允许最终一致、可异步处理、需要缓冲突发或解耦发布节奏的场景。同步多级调用会把延迟相加并把故障沿链传播；异步则引入重复投递、乱序、延迟可见和补偿流程。无论哪种，接口都要有明确的请求/响应契约、错误语义、超时/截止时间、鉴权与版本兼容策略。
+
+**Feign 错误处理**：非 2xx 响应可能经过 `ErrorDecoder` 转换为异常；不要把所有异常都转成空对象，否则上游会把故障当成功。Fallback 应显式区分可降级的非核心数据和必须失败的核心命令，并记录原始异常/下游状态。幂等请求重试可以使用退避和抖动；非幂等写请求只有在服务端接受同一幂等键并可返回原结果时才考虑重试。
+
 | 配置项 | 作用 | 注意 |
 | --- | --- | --- |
-| `feign.client.config.<name>.connectTimeout/readTimeout` | 连接/读取超时 | Feign 默认 connect 10s / read 60s（`Request.Options`）；**启用 Hystrix 时其 1s 默认超时先触发** |
-| `feign.client.config.<name>.loggerLevel` | 日志级别 | 需配合 `logging.level.<feign接口包>=debug` |
-| `spring.cloud.openfeign.client.config.*` | Boot 3/Cloud 4 的新前缀 | 旧前缀为 `feign.client.config.*`，升级时注意变化 |
-| `feign.okhttp.enabled=true` | 换 OkHttp 连接池 | 默认用 JDK HttpURLConnection（无连接池），生产建议替换 |
-| `feign.compression.request/response.enabled` | 请求/响应压缩 | 大报文场景开启 |
-| `feign.circuitbreaker.enabled=true` | 启用 CircuitBreaker 集成 | Boot 3/Cloud 4 中 Hystrix 已移除，用 Sentinel/Resilience4j |
+| `spring.cloud.openfeign.client.config.<name>.connectTimeout/readTimeout` | 连接/读取超时 | Cloud 4 常见前缀；旧版属性前缀不同，默认值及单位需查对应版本文档 |
+| `spring.cloud.openfeign.client.config.<name>.loggerLevel` | 日志级别 | 还需为 Feign 接口包开启 DEBUG；FULL 可能泄露敏感信息 |
+| `spring.cloud.openfeign.okhttp.enabled` / `httpclient.hc5.enabled` | 选择 OkHttp / Apache HC5 客户端 | 具体默认 HTTP Client 由 Cloud 版本与 classpath 决定，不要假定所有版本都使用 JDK 客户端 |
+| `spring.cloud.openfeign.compression.request/response.enabled` | 请求/响应压缩 | 压缩会消耗 CPU，适合大报文且链路支持的场景 |
+| `spring.cloud.openfeign.circuitbreaker.enabled` | 启用 Spring Cloud CircuitBreaker 集成 | 需要相应实现（如 Resilience4j）；不等同于 Feign 默认自带熔断 |
 
-**重试与幂等**：Feign 默认不重试，但与 LoadBalancer/Ribbon 组合时可能出现重试（`Retryer`、`spring.cloud.loadbalancer.retry.*`）。**重试会导致同一请求被执行多次，因此只对幂等接口开重试（GET/查询），写接口要靠幂等键保护**（见 [SpringMVC 篇](./03-SpringMVC与Web容器.md)）。**拦截器**（`RequestInterceptor`）常用于传递 TraceId、Token、灰度标、租户 ID——这是微服务里非常关键的横切能力。
+**重试与幂等**：Spring Cloud OpenFeign 通常配置为默认不重试，但 LoadBalancer、HTTP 客户端、网关或业务代码还可能各自重试，必须检查整条链路而非只看 Feign。**重试会导致同一请求被执行多次，因此只对安全幂等操作开重试；写接口要靠幂等键保护**（见 [SpringMVC 篇](./03-SpringMVC与Web容器.md)）。**拦截器**（`RequestInterceptor`）常用于传递 TraceId、Token、灰度标、租户 ID；异步调用时要显式传播上下文，不能假设 ThreadLocal 自动跨线程。
 ### 6.2 面试问答
 **Q1：Feign 的调用原理？** A：动态代理 + 编解码 + 负载均衡：接口方法调用被代理拦截，按注解生成 HTTP 请求（Encoder 编码），由集成了负载均衡的 Client 选实例发送，再用 Decoder 反序列化响应。**本质是把 HTTP 调用伪装成本地方法调用**，代价是错误处理、超时、重试、序列化都要额外配置。
-**Q2：Feign 超时怎么配？为什么总是 1 秒超时？** A：Feign 自身默认 connect 10s / read 60s；但启用 Hystrix 后其默认 1s 熔断超时会先生效，于是表现为"调用超过 1 秒就被熔断"。Boot 3/Cloud 4 已移除 Hystrix，改用 Sentinel/Resilience4j，超时由 Feign 配置 + 熔断器配置共同决定。**规范：显式配置连接/读超时，并让上游超时大于下游总耗时预算。**
+**Q2：Feign 超时怎么配？为什么历史系统总是 1 秒超时？** A：超时由底层 HTTP Client、Feign/LoadBalancer 以及外层熔断器共同决定，默认值随版本与客户端实现变化，不能照搬某一个默认数。旧系统若启用 Hystrix，Hystrix 的超时可能先于 Feign 的读超时触发，旧版常见约 1 秒配置；Boot 3/现代 Cloud train 不再使用 Hystrix 默认集成，需按所选客户端和 Resilience4j/Sentinel 等实现显式配置连接、读取、总预算与熔断时间。**规范：上游总超时要覆盖下游预算，且留出序列化和返回时间。**
 **Q3：Feign 和 RestTemplate 怎么选？** A：Feign 是声明式、接口化、易复用（自带负载均衡、编解码、拦截器），适合服务间大量 RPC；RestTemplate 是编程式、灵活但样板代码多（需 `@LoadBalanced` 才有负载均衡），适合少量调用或需要精细控制的场景。新项目推荐 Feign（或 WebClient 做响应式）。
 **Q4：Feign 怎么传递 Token 和 TraceId？** A：实现 `RequestInterceptor`，从 `RequestContextHolder` 取当前请求头，把 `Authorization`、`X-Trace-Id`、`X-Gray` 等写入 Feign 请求模板；异步场景（Hystrix/Sentinel 线程池隔离、@Async）需用 `RequestContextHolder.setRequestAttributes(..., true)` 或 TransmittableThreadLocal 跨线程传递，否则"传不进去"。
+
+**调用链预算示例**：入口总预算 800 ms，网关最多用 700 ms，服务 A 为下游 B 预留 300 ms，B 的 HTTP 读取超时例如 200 ms；这里的数字仅作预算示意，需根据业务 SLO 和网络测量确定。若每一层各自配置 1 秒超时，整条链路可能远超用户预算。重试也消耗同一预算：一次 200 ms 调用加退避后重试不能超出上游 deadline；不要让多个层级各重试 3 次导致最多 3×3×3 次下游请求。
 ### 6.3 高频追问与陷阱
 - 陷阱：`RequestInterceptor` 是全局的，若要在不同 FeignClient 传递不同信息，需按 `@FeignClient(configuration=...)` 隔离配置类。
 - 陷阱：feign 日志级别为 FULL 会打印请求体，**可能把敏感信息写进日志**，生产用 BASIC 或 HEADERS。
@@ -215,23 +241,36 @@ public interface UserClient {
     @GetMapping("/{id}") UserVO get(@PathVariable("id") Long id);
     @PostMapping("/batch") List<UserVO> batch(@RequestBody List<Long> ids);
 }
-@Component
-public class FeignConfig implements RequestInterceptor {
-    @Override public void apply(RequestTemplate t) {
-        ServletRequestAttributes a = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-        if (a == null) return;
-        t.header("X-Trace-Id", a.getRequest().getHeader("X-Trace-Id"));      // 透传链路
-        t.header("Authorization", a.getRequest().getHeader("Authorization")); // 透传凭证
+// 按 client 隔离的配置类不要放在主应用组件扫描范围内，否则可能变成全局配置。
+public class FeignConfig {
+    @Bean
+    RequestInterceptor userContextInterceptor() {
+        return t -> {
+            ServletRequestAttributes a =
+                    (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (a == null) return;
+            String traceId = a.getRequest().getHeader("X-Trace-Id");
+            String authorization = a.getRequest().getHeader("Authorization");
+            if (traceId != null) t.header("X-Trace-Id", traceId);
+            if (authorization != null) t.header("Authorization", authorization);
+        };
     }
 }
 ```
 ```yaml
-feign:
-  okhttp: { enabled: true }        # 使用 OkHttp 连接池
-  client:
-    config:
-      default: { connectTimeout: 1000, readTimeout: 3000, loggerLevel: basic }
+spring:
+  cloud:
+    openfeign:
+      okhttp:
+        enabled: true              # 仅在添加兼容 OkHttp 依赖且版本支持时启用
+      client:
+        config:
+          default:
+            connectTimeout: 1000
+            readTimeout: 3000
+            loggerLevel: basic
 ```
+代码使用 Servlet 请求上下文，适用于由 HTTP 请求触发的同步调用；定时任务、消息消费和异步线程没有当前 Servlet 请求，不能从 `RequestContextHolder` 取上下文。生产还应使用受信任的上下文传播机制，并避免从客户端透传未经验证的用户身份头。`fallbackFactory` 需启用相应 CircuitBreaker 集成并自行实现工厂；不应在 fallback 中再次无保护地调用同一个故障服务。
 ### 6.5 一句话速记
 Feign = 动态代理 + Encoder/Decoder + 负载均衡 Client；超时/重试/幂等/拦截器传递上下文是四大配置要点。
 
@@ -252,6 +291,12 @@ Feign = 动态代理 + Encoder/Decoder + 负载均衡 Client；超时/重试/幂
 **Sentinel 关键概念**：资源（被保护的代码/接口）、规则（流控、熔断、热点、系统、授权）、Slot 责任链（每个 Slot 做一件事，`FlowSlot` 做流控、`DegradeSlot` 做熔断）、**滑动窗口**（默认 1s 窗口分 2 个 500ms 桶，`sampleCount` 与 `windowLengthInMs` 可配，桶越细越平滑）、**熔断状态机**（CLOSED → 达到阈值 OPEN → 经过熔断时长进入 HALF_OPEN 放行探测 → 成功则 CLOSED，失败则回 OPEN）。
 
 **流控规则三要素**：阈值类型（QPS 或并发线程数）、流控模式（直接/关联/链路）、流控效果（快速失败/预热 Warm Up/匀速排队）。**熔断降级规则**：慢调用比例、异常比例、异常数（均需设置最小请求数与统计窗口）。**集群流控**：Token Server（独立或嵌入模式，`embedded` 由某个实例承担）+ Token Client 上报与批量取 token，解决单机阈值不均衡问题。**规则持久化**：默认规则存内存（重启丢失），生产用 **Nacos/ Apollo/ZooKeeper 数据源 + push 模式**，由控制台写入配置中心、客户端监听变更实时更新。
+
+**几种保护措施解决不同问题**：超时给一次等待设置上限；并发隔离限制某个依赖占用的线程/连接；限流限制进入速率；熔断在依赖持续失败或变慢时暂时停止调用；降级决定失败时返回什么。它们不能互相替代：只设置熔断而没有超时，正在执行的慢请求仍可能一直占住线程；只设置限流但没有排队上限，内部任务队列仍可能堆积；fallback 也不能把未知错误伪装成成功订单。
+
+**熔断与恢复要防抖**：熔断统计至少要有最小样本数，窗口、慢调用阈值和开路时长要按业务延迟分布设置；流量恢复时可通过 HALF_OPEN 探测、预热或逐步放量避免瞬间冲击。告警要同时看拒绝数、慢调用比例、熔断状态、线程池/连接池饱和和恢复情况。具体熔断状态细节因 Resilience4j、Sentinel 等实现而异，通用三态只是便于理解的模型。
+
+**组件不是必选项**：Spring Cloud CircuitBreaker 是抽象层，可对接 Resilience4j 等实现；Sentinel 是另一套流控/熔断治理方案，Spring Cloud Alibaba 提供集成。Hystrix 属于历史方案，现代 Spring Cloud 版本不再将它作为默认组件。应选一个主要治理实现并核对版本兼容，不要让多个熔断器在多层叠加而不清楚谁先拒绝、谁触发 fallback。
 ### 7.2 面试问答
 **Q1：Hystrix 的线程池隔离和信号量隔离有什么区别？** A：线程池隔离给每个依赖独立线程池，超时可直接中断（依赖阻塞不影响调用方线程），但线程切换有开销、线程数需分配；信号量隔离在原线程上加计数，开销小、无切换，但**不能中断超时**（只限制并发数）。默认线程池隔离，对延迟敏感/调用量极大的场景可用信号量隔离。
 **Q2：熔断器的三个状态与转换条件？** A：CLOSED（正常放行并统计）→ 统计窗口内错误率/慢调用比例/异常数超过阈值 → OPEN（快速失败，不再调用下游）→ 经过熔断时长后进入 HALF_OPEN（放行少量探测请求）→ 探测成功则 CLOSED，失败则回到 OPEN。**关键是阈值来自统计窗口，而非瞬时值。**
@@ -269,6 +314,7 @@ public UserVO get(Long id) { return userClient.get(id); }
 public UserVO blocked(Long id, BlockException e) { return UserVO.empty("限流"); }
 public UserVO fallback(Long id, Throwable t) { return UserVO.empty("降级"); }
 ```
+此示例表达语义：`blockHandler` 处理 Sentinel 规则拒绝（方法签名需包含匹配参数及 `BlockException`），`fallback` 处理业务执行异常；真实方法和兜底方法需符合所用 Sentinel/SCA 版本的签名要求。确保请求经过 Sentinel 的代理/资源埋点，且方法不是通过同一对象的自调用绕过拦截；若自调用、异步或 WebFlux 场景，应按对应集成方式创建资源并传播上下文。兜底返回“限流”也不应让客户端误以为写操作已成功。
 ```yaml
 spring:
   cloud:
@@ -283,7 +329,13 @@ spring:
 
 ## 8. 网关
 ### 8.1 核心原理
-**Gateway 三大组件**：Route（路由：id + uri + predicates + filters）、Predicate（断言，决定是否匹配该路由）、Filter（过滤器，改写请求/响应）。底层是 **Spring WebFlux + Reactor Netty**，全异步非阻塞。
+**Gateway 三大组件**：Route（路由：id + uri + predicates + filters）、Predicate（断言，决定是否匹配该路由）、Filter（过滤器，改写请求/响应）。经典的 Spring Cloud Gateway Server 基于 **Spring WebFlux + Reactor Netty**；较新版本还提供基于 Servlet MVC 的 Gateway Server MVC 变体，运行模型与可用过滤器/属性不完全相同。本文的 `GlobalFilter`、`lb://` 等示例针对 Reactive Gateway，实际项目先确认所选 starter 和版本，不能把两种实现混为一谈。
+
+**路由处理顺序**：请求先由 `RoutePredicateHandlerMapping` 找到所有断言匹配的路由，多个候选按 order 等规则决定；随后全局过滤器与路由过滤器按 order 组成过滤器链。前置过滤器可鉴权、改路径、加追踪头；路由过滤器选择目标 URI 并转发；后置逻辑处理响应、指标或审计。`lb://service-name` 表示通过 Spring Cloud LoadBalancer 解析服务名；`http://host:port` 则是固定目标，不经过服务发现。路由匹配成功不代表下游一定可用，转发仍需要超时与错误处理。
+
+**响应式不等于代码自动非阻塞**：Reactor Netty 的少量事件循环线程负责许多连接；若在其中同步访问 JDBC、调用阻塞式 HTTP 客户端、做长时间 CPU 运算，会占住事件循环并让大量连接一起变慢。优先使用响应式客户端；必须调用阻塞 API 时要在适当边界交给有界 `boundedElastic` 等专用执行器，并限制并发。只加 `subscribeOn` 不能把阻塞工作“变成非阻塞”，还可能导致无界线程/队列压力。
+
+**网关是边界层，不应代替业务授权**：网关适合做统一路由、粗粒度认证、限流、头部清理、TLS 后的安全上下文传递；服务仍要校验资源归属和业务权限，特别是存在绕过网关的内部访问路径时。网关注入身份头前应移除客户端同名伪造头，并通过网络策略/mTLS/签名等限制下游只接受可信来源。每个下游要保留自己的超时、隔离和权限校验。
 
 | 过滤器/断言 | 作用 |
 | --- | --- |
@@ -316,7 +368,7 @@ spring:
       routes:
         - id: user-service
           uri: lb://user-service
-          predicates: [ "Path=/api/user/**", "Weight=user-service, 90" ]   # 90% 走主版本（灰度）
+          predicates: [ "Path=/api/user/**" ]
           filters:
             - StripPrefix=1
             - AddRequestHeader=X-Gray, false
@@ -324,8 +376,8 @@ spring:
               args:
                 redis-rate-limiter.replenishRate: 100
                 redis-rate-limiter.burstCapacity: 200
-                key-resolver: "#{@ipKeyResolver}"
 ```
+此处省略 `key-resolver`，Gateway 使用其默认 Principal 名称解析器；这适合已有认证主体的请求，匿名请求需要明确设计限流 key。若改为自定义 IP resolver，只有在可信代理正确清洗/写入转发头的前提下才能使用客户端 IP，不能盲信外部传来的 `X-Forwarded-For`。`Weight` 断言则需要同一 weight group 中存在多个可比较路由；只配一条权重路由不能形成 90/10 灰度。
 ```java
 @Component
 public class AuthGlobalFilter implements GlobalFilter, Ordered {
@@ -338,7 +390,8 @@ public class AuthGlobalFilter implements GlobalFilter, Ordered {
             return exchange.getResponse().setComplete();
         }
         ServerHttpRequest req = exchange.getRequest().mutate()
-                .header("X-User-Id", jwtService.userId(token)).build();    // 注入身份，下游信任
+                .headers(h -> { h.remove("X-User-Id"); h.set("X-User-Id", jwtService.userId(token)); })
+                .build();    // 覆盖客户端伪造值后注入身份
         return chain.filter(exchange.mutate().request(req).build());
     }
     @Override public int getOrder() { return -100; }   // 越早越好
@@ -354,6 +407,10 @@ Gateway = Route + Predicate + Filter（WebFlux 非阻塞）；鉴权注入头 + 
 **技术演进**：Spring Cloud Sleuth（Brave/Zipkin 生态）在 Boot 3 / Cloud 2022+ 被 **Micrometer Tracing** 取代（Observability API + Brave 或 OpenTelemetry bridge），日志中自动填充 traceId/spanId（配合 `logging.pattern.level` 输出）；采集端可用 Zipkin、Tempo、Jaeger、SkyWalking、OTLP Collector。
 
 **SkyWalking 无侵入方案**：基于 Java Agent（字节码增强）自动埋点，业务零改动即可获得拓扑图、慢 SQL、JVM 指标、告警；适合"多语言/老系统统一观测"。代价是 Agent 与版本兼容、采样与开销需要评估，且深度定制（业务标签）仍需手动埋点。**选择建议**：新项目用 Micrometer Tracing + OTLP（标准、可插拔）；已有 SkyWalking 体系或需要无侵入能力则继续用 SkyWalking。**告警**：追踪数据要落到 APM/日志平台并配置告警（错误率、P99 延迟、慢 SQL、依赖拓扑异常），"只有链路图没有告警"等于没做可观测性。
+
+**三类观测数据各自回答不同问题**：Metrics 是聚合计数/分布，回答“错误率和 P99 是否变坏”；Logs 记录离散事件，回答“某次请求具体发生了什么”；Traces 连接同一请求的跨服务 Span，回答“耗时花在哪一跳”。TraceId 可放入日志上下文便于关联，但不要把高基数 TraceId 当作 Metric label；也不要把密码、完整 Token、身份证等敏感值放进 Span 标签或 baggage。采样会丢弃部分 Trace，因此容量告警和 SLO 统计必须依赖 Metrics，而不是只依赖追踪平台。
+
+**采样与上下文传播的生产边界**：概率采样通常在入口决定，并在跨服务时传播采样标记，避免每个服务各采各的造成链路断层。异步线程、Reactor Context、消息队列和定时任务需要各自的上下文桥接；TraceId 是关联标识，不是认证凭据，不可用来授权。Micrometer Tracing 的 bridge、传播格式（W3C/B3）及导出协议由依赖与版本决定，迁移 Sleuth 时需验证上下游格式兼容和日志字段名称。
 ### 9.2 面试问答
 **Q1：链路追踪的原理？** A：入口生成/继承 TraceId，每次跨进程调用创建一个 Span 并把 TraceId + ParentSpanId 通过 header 传出，下游继续上面的父 Span 形成调用树；采集端聚合 Span 还原调用链、耗时与依赖拓扑。**关键是上下文传播 + 采样**（高流量下全量采集不现实）。
 **Q2：线上怎么快速定位一个慢请求？** A：从入口日志拿到 TraceId（或从用户投诉的请求 ID）→ 在 APM/日志平台按 TraceId 检索 → 看各 Span 耗时找出占比最大的环节 → 若是 DB 则看慢 SQL 与执行计划，若是 RPC 则看下游与连接池，若是本地代码则看线程栈与 GC。**前提是 TraceId 全链路透传，包括 MQ 与异步线程。**
