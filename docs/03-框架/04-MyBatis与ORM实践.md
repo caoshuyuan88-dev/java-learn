@@ -31,9 +31,80 @@
 
 ## 1. MyBatis 架构与执行流程
 ### 1.1 核心原理
-**构建链路**：`SqlSessionFactoryBuilder` 读配置（mybatis-config.xml 或 Boot 的 Configuration 对象）→ `XMLConfigBuilder`/`XMLMapperBuilder` 解析出 `Configuration`（含 Environment、TypeHandlerRegistry、MapperRegistry、MappedStatement 注册表）→ `DefaultSqlSessionFactory`。
+#### 先用人话理解：MyBatis 替你把 Java 方法和 SQL 接起来
 
-**执行链路**：`SqlSessionFactory#openSession` → `SqlSession`（默认 `DefaultSqlSession`）→ `Executor`（默认 SimpleExecutor，二级缓存开启时被 CachingExecutor 装饰）→ `MappedStatement`（一条 SQL 的全部元信息）→ `StatementHandler`（负责创建 Statement、设置参数占位）→ `ParameterHandler`（把 Java 参数写进 PreparedStatement）→ JDBC 执行 → `ResultSetHandler`（把 ResultSet 映射成对象，内部用 `TypeHandler`）→ 返回结果。
+你在 Java 里调用 `userMapper.findById(42L)`，MyBatis 要依次解决几件事：这个方法对应哪段 SQL？`42` 应该放进 SQL 哪个位置？怎么把数据库返回的一行列值填进 Java 对象？这些工作串起来，就是 MyBatis 的执行链路。
+
+更重要的是，**“构建”发生在应用启动时，“执行”发生在每次调用 Mapper 时**。启动时准备好 SQL 的“说明书”；运行时拿说明书和本次参数生成真正要执行的 SQL。
+
+#### 启动时的构建链路：每一步的输入、工作和产物
+
+把 MyBatis 想成开餐厅：配置和 Mapper XML 是菜单与菜谱；解析后形成可以快速查找的菜单册；`SqlSessionFactory` 是之后按桌次开服务单的总台。构建过程不是执行查询，而是把这些定义读进内存、检查并准备好。
+
+| 步骤 | 输入是什么 | 这一步做什么 | 产物是什么，后面谁用 |
+| --- | --- | --- | --- |
+| 1. 准备配置来源 | 传统项目的 `mybatis-config.xml`、Mapper XML；Spring Boot 项目中的 YAML 属性、Java 配置和扫描到的 Mapper/XML | 告诉 MyBatis 数据库环境、Mapper 在哪、别名/TypeHandler 等怎么配置。Boot Starter 会把分散的配置组装起来，不一定需要手写 `mybatis-config.xml`。 | 配置解析器可以读取的配置信息。 |
+| 2. 创建 `Configuration` | 上一步的设置与 Mapper 定义 | 把“全局规则”和“已登记的 SQL/Mapper”放在一个中心对象里。它不是数据库连接，而是 MyBatis 运行时的内存配置仓库。 | 一个 `Configuration` 对象，供后面工厂和执行流程查询。 |
+| 3. 解析 Mapper 接口和 XML | Mapper 接口、XML 中的 `<select>`/`<insert>` 等定义 | 检查 XML 的 namespace、statement id、参数和结果映射；将每条 SQL 登记到配置仓库。 | `MapperRegistry` 记住“哪些接口可以生成代理”；`MappedStatement` 记住“每条 SQL 的说明书”。 |
+| 4. 创建 `SqlSessionFactory` | 完成配置的 `Configuration` | 把配置封装成应用级工厂。它负责之后创建 SqlSession；自身通常在应用启动时建一次，供多个线程共同使用。 | `SqlSessionFactory`。Mapper 调用最终要借由它获得 Session；Spring Boot 通常把它作为 Spring Bean。 |
+| 5. 每次工作时打开 `SqlSession` | `SqlSessionFactory`、事务/连接设置 | 为一次数据库工作准备会话、Executor、事务和缓存上下文。 | `SqlSession`：这次工作的入口和上下文；原生 SqlSession 不应被多线程共享。Spring 项目一般由 `SqlSessionTemplate` 管理，而不是业务代码手动打开。 |
+
+几个关键“产物”的用途再拆开看：
+
+- **`Configuration`**：类似总目录。里面登记 Mapper、SQL 说明书、TypeHandler、缓存配置和 Environment 等信息。查到它不表示查询已经执行。
+- **`MapperRegistry`**：记住 Mapper 接口及其代理工厂。调用 `getMapper(UserMapper.class)` 时，MyBatis 才能知道要给接口创建代理。
+- **`MappedStatement`**：一条 Mapper SQL 的静态说明书，含 statement id、SQL 来源、参数类型、结果映射、缓存和执行选项。它通常按 `namespace + 方法/statement id` 查找。
+- **`SqlSessionFactory`**：使用上面准备好的配置生产 SqlSession 的工厂。它是长生命周期对象，通常应用启动时创建一次；不要把它和 SqlSession 混为一谈。
+- **`SqlSession`**：一次会话的工作上下文，关联 Executor、事务和一级缓存。它不是全局工厂，也不适合跨线程保存。
+
+#### 用一个最小例子对应“说明书”
+
+```java
+public interface UserMapper {
+    User findById(@Param("id") Long id);
+}
+```
+
+```xml
+<mapper namespace="com.example.UserMapper">
+  <select id="findById" resultType="com.example.User">
+    select id, name from t_user where id = #{id}
+  </select>
+</mapper>
+```
+
+启动解析 XML 后，MyBatis 会登记一条 id 类似 `com.example.UserMapper.findById` 的 `MappedStatement`。接口方法只是 Java 侧入口；XML 才提供 SQL 的定义。运行时接口名、namespace 和 statement id 对不上，说明书就找不到，常见报错是 `Invalid bound statement (not found)`。
+
+#### 每次调用时的执行链路：每个中间结果交给谁
+
+业务代码调用 `findById(42L)` 后，大致发生以下事情。不同 Executor 或插件可能改变部分步骤，但主线不变：
+
+| 步骤 | MyBatis 做什么 | 产生的东西 / 后续用途 |
+| --- | --- | --- |
+| 1. Mapper 代理接住方法调用 | `MapperProxy` 看到调用的方法、参数和 Mapper 接口。它把 Java 方法名与 namespace 组合成 statement id。 | statement id（例如 `com.example.UserMapper.findById`）和参数对象。 |
+| 2. 找到 `MappedStatement` | 用 statement id 到 `Configuration` 的目录中找到 SQL 说明书。 | 该 SQL 的静态配置；如果找不到，通常报 `Invalid bound statement`。 |
+| 3. 生成本次的 `BoundSql` | 根据本次参数处理 `<if>`、`<foreach>` 等动态 SQL，并把 `#{id}` 转成 `?`。 | `BoundSql`：本次最终 SQL 文本、占位符参数映射及参数对象。动态 SQL 每次可能不同；`MappedStatement` 本身仍是说明书。 |
+| 4. Executor 判断怎么执行 | 处理缓存、事务和执行策略；例如先查一级缓存，必要时继续访问数据库。 | 缓存命中就可直接返回对象；未命中则把 BoundSql 交给下游。 |
+| 5. StatementHandler 准备 JDBC 语句 | 根据 SQL 创建合适的 JDBC Statement；常见预编译方式是 `PreparedStatement`。 | JDBC 语句对象，接下来由 ParameterHandler 设置 `?` 的值。 |
+| 6. ParameterHandler 绑定参数 | 按 `BoundSql` 中的参数映射，找到 Java 参数值，并调用合适的 TypeHandler。 | 例如执行 `preparedStatement.setLong(1, 42L)`；参数值作为数据传递，不和 SQL 语法拼成一段。 |
+| 7. JDBC 驱动访问数据库 | 驱动把 SQL 和绑定参数送给数据库，执行查询。 | 数据库返回 JDBC `ResultSet`（结果行集合）。 |
+| 8. ResultSetHandler 映射结果 | 按 `resultType` 或 `resultMap` 逐行读取列，并用 TypeHandler 把 JDBC 类型转换成 Java 类型。 | `User` 对象或对象列表，交还 Mapper 代理。 |
+| 9. Mapper 方法返回 | 代理根据方法返回类型返回单个对象、集合等。 | 业务代码拿到查询结果。查询后需要提交/关闭的事务和 Session 由原生调用方或 Spring 集成层管理。 |
+
+```text
+启动一次：XML/配置 → Configuration（内存目录）→ MappedStatement（每条 SQL 的说明书）→ SqlSessionFactory
+
+每次调用：Mapper 方法 → 代理找到说明书 → BoundSql（本次最终 SQL）
+        → Executor → StatementHandler / ParameterHandler
+        → JDBC → ResultSet → ResultSetHandler → Java 对象
+```
+
+最容易混淆的两个对象：
+
+- `MappedStatement` 是“固定的 SQL 配置说明书”，应用启动解析 Mapper 时登记。
+- `BoundSql` 是“本次参数对应的最终 SQL 和参数表”，调用 Mapper 时生成。
+
+同一个 `MappedStatement` 可能因不同查询条件，生成不同 `BoundSql`。MyBatis 缓存按最终 SQL 和参数等信息区分请求，不是只看 Mapper 方法名。
 
 | 组件 | 职责 | 线程安全 |
 | --- | --- | --- |
@@ -58,6 +129,16 @@
 `MappedStatement` 是解析配置时创建的相对静态元数据；`BoundSql` 是某次调用根据参数生成的动态 SQL。这个区别很重要：同一条 statement 可以因不同参数生成不同 SQL（例如动态 where 条件），而缓存键还会考虑最终 SQL 和参数等信息。
 
 `SqlSessionTemplate` 的线程安全来自“每次调用通过代理定位当前线程/事务绑定的 SqlSession”，不是把一个原生 `DefaultSqlSession` 变成线程安全对象。存在 Spring 事务同步时，同一事务里的 Mapper 操作可复用绑定的 Session；没有事务时，单次 Mapper 调用通常独立获取并关闭 Session。事务外连续两次查询不要依赖一级缓存命中。
+
+#### Spring 管理下，谁负责打开和关闭会话？
+
+原生 MyBatis 示例通常由调用者自己 `openSession()`、提交事务并 `close()`。Spring 集成后，`SqlSessionTemplate` 扮演安全的代理入口：每次 Mapper 调用时找到当前事务绑定的 SqlSession；若当前线程还没有，就按配置取得一个；事务结束时由 Spring 完成提交/回滚和资源清理。**不要把原生 SqlSession 存在单例 Service 字段里，也不要在 Spring 事务中自己随意 `openSession()`/`commit()`。**
+
+```text
+Spring 事务开始 → 获取并绑定 Connection/SqlSession
+Mapper 方法调用 → SqlSessionTemplate 找到当前会话 → 执行 SQL
+事务提交或回滚 → Spring 处理事务 → 释放会话和连接
+```
 ### 1.2 面试问答
 **Q1：MyBatis 的执行流程？** A：SqlSessionFactory 构建 → openSession 得到 SqlSession → 通过 Executor 执行 MappedStatement → StatementHandler 创建并参数化 Statement（ParameterHandler）→ JDBC 执行 → ResultSetHandler + TypeHandler 映射结果 → 返回；过程中穿插一二级缓存查询与延迟加载处理。
 **Q2：SqlSession 是线程安全的吗？Spring 里怎么解决？** A：MyBatis 原生 SqlSession **不是线程安全的**（内部持连接与缓存，且 DefaultSqlSession 有非线程安全字段）。Spring 通过 `SqlSessionTemplate`（线程安全的代理）+ `SqlSessionInterceptor` 实现：每个操作从 `SqlSessionHolder` 获取或创建 SqlSession，并绑定到 Spring 事务，事务提交/回滚时统一关闭。手动 openSession 会脱离这套机制。
@@ -79,6 +160,10 @@ Factory → SqlSession（不安全）→ Executor → Statement/Parameter/Result
 
 ## 2. 四大对象与插件机制
 ### 2.1 核心原理
+先把“四大对象”理解成一次 SQL 工作中的四个工位，而不是四个要由业务代码手动创建的对象：Executor 决定怎么执行；StatementHandler 准备 JDBC 语句；ParameterHandler 把参数放进问号；ResultSetHandler 把数据库返回的行变成 Java 对象。MyBatis 在内部创建它们，插件可以在指定工位的指定方法外面包一层逻辑。
+
+插件调用时的产物是**一个代理对象**：外部仍调用原有接口，但先经过插件的 `intercept`；`invocation.proceed()` 把调用交给下一层，所有插件放行后才到原来的 MyBatis 对象。插件可以记录耗时、改 SQL 或检查参数，但若忘记 `proceed()`，就可能把真正的 SQL 执行拦掉。
+
 **可拦截的方法**（由 `@Intercepts` + `@Signature(type, method, args)` 精确指定）：
 
 | 被拦截对象 | 常用可拦截方法 | 典型插件 |
@@ -122,6 +207,19 @@ public class CostPlugin implements Interceptor {
 
 ## 3. 动态 SQL 标签
 ### 3.1 核心原理
+
+动态 SQL 的作用是：**根据本次请求实际提供的条件，组装出一条完整 SQL**。例如用户只填写客户名称时就只按名称搜索；同时填写名称和状态时，两种条件都拼进去。XML 标签不是直接执行 SQL，而是在调用时按参数选择/拼接文本，最后生成 `BoundSql`，再进入第 1 章的 JDBC 执行链路。
+
+```text
+Mapper XML（带 <if>/<where> 的模板）
+        + 本次参数（name="Acme", status=null）
+        ↓ MyBatis 按条件处理 XML 节点
+BoundSql（最终 SQL + ? 参数映射 + 参数对象）
+        ↓ ParameterHandler 绑定参数
+JDBC 执行
+```
+
+所以调试动态 SQL 时，要分别看**模板长什么样**和**这一次实际生成的 SQL 长什么样**。前者在 Mapper XML，后者可以通过 MyBatis SQL 日志或插件观察。
 
 | 标签 | 作用 | 注意 |
 | --- | --- | --- |
@@ -175,6 +273,8 @@ public class CostPlugin implements Interceptor {
 
 ## 4. #{} 与 ${} 与 SQL 注入
 ### 4.1 核心原理
+
+SQL 可以分成两种东西：**数据值**和**SQL 结构**。例如订单状态 `PAID` 是值；`order by create_time desc` 中的列名和排序方向是结构。`#{}` 适合数据值：SQL 先保留问号，之后 JDBC 绑定值；`${}` 是把文本提前塞进 SQL 结构。记住“值参数化、结构白名单”，比死背语法更可靠。
 
 | 维度 | `#{}` | `${}` |
 | --- | --- | --- |
@@ -231,6 +331,16 @@ String direction = "desc".equalsIgnoreCase(dto.getSortOrder()) ? "DESC" : "ASC";
 ## 5. 一级缓存与二级缓存
 ### 5.1 核心原理
 
+缓存的直观作用是“刚刚查过的结果先留一份，条件相同的查询可能直接复用”，省掉数据库往返。但要问清楚**谁保存、谁能看到、什么时候清掉**，否则容易把“命中缓存”误认为“数据库最新数据”。
+
+```text
+第一次查询：Mapper → 一级缓存没找到 → 查数据库 → 结果放进缓存并返回
+同一缓存范围内再查相同条件：命中 → 直接返回缓存对象
+发生写操作/缓存失效：清掉对应缓存 → 下次重新查数据库
+```
+
+MyBatis 一级缓存是 SqlSession 自己手边的便签，只在这个 SqlSession 的范围内；二级缓存是 Mapper namespace 共享的缓存，范围更大，但也更难知道别的 Mapper、别的应用实例是否改了相关数据。
+
 | 维度 | 一级缓存 | 二级缓存 |
 | --- | --- | --- |
 | 作用域 | SqlSession 级（Spring 下绑定一个事务） | namespace（Mapper）级，跨 SqlSession |
@@ -270,6 +380,16 @@ mybatis:
 
 ## 6. 延迟加载与 N+1 问题
 ### 6.1 核心原理
+举例：先查出 20 个订单，然后页面需要显示每个订单的明细。如果主查询发 1 次 SQL，之后每个订单再单独查一次明细，就成了 1 + 20 次查询，这就是 N+1。关键不是“写了几行 Java”，而是一次接口请求到底触发了多少次数据库往返。
+
+延迟加载的意思是“先不查关联对象，等代码真正读取这个属性时再查”。它可能避免完全没用到关联数据时的查询，但**不会自动把 20 次明细查询合并成 1 次**。如果序列化响应时逐个读取 20 个订单的 `items`，仍可能执行 20 次额外查询。
+
+```text
+立即加载：查订单 + 立刻逐单查明细 → 1 + N 次 SQL
+延迟加载：先查订单；有人读取 items 时再查 → 可能仍是 1 + N 次 SQL，只是发生得更晚
+批量装配：查订单 → 收集这页订单 ID → 一次 IN 查询所有明细 → 按订单 ID 分组 → 1 + 1 次 SQL
+```
+
 **延迟加载**：`association`/`collection` 用嵌套 select（`select="..."`）时才生效，并且需要 `lazyLoadingEnabled=true`（MyBatis 默认 false）；`fetchType="lazy|eager"` 可单条覆盖全局配置；`aggressiveLazyLoading`（3.4.1+ 默认 false，已废弃的语义）控制是否一触发就加载全部懒属性。**延迟加载依赖关联查询仍可使用 SqlSession/Executor**；Spring 默认在事务同步期间复用会话，因此应在事务内访问。事务外若会话已关闭，访问懒属性可能无法执行关联查询；OpenSessionInView 等扩展会改变生命周期，但会延长数据库会话范围，不应以此替代明确的 DTO 组装。
 
 **N+1 问题**：查 N 条主记录后，为了组装关联对象又发了 N 条（或 1 条 join 重复行）查询，总计 N+1 次数据库交互。典型来源：循环里 `mapper.selectById`、`association select` 在无延迟加载时逐条触发、ORM 的懒加载在序列化时被触发。
@@ -316,6 +436,17 @@ orders.forEach(o -> o.setItems(grouped.getOrDefault(o.getId(), Collections.empty
 
 ## 7. resultMap、TypeHandler 与主键回填
 ### 7.1 核心原理
+数据库返回的是“列名 + JDBC 类型 + 列值”的行；Java 代码想要的是字段有含义的对象。`resultType` 是“列名与属性名大致能对上时，让 MyBatis 自动填”；`resultMap` 是“我明确告诉 MyBatis 哪一列放到哪个属性、哪个列组成关联对象”。`TypeHandler` 则负责单个值的跨界转换，例如数据库里的整数 `1` 转成 Java 枚举 `ACTIVE`。
+
+```text
+数据库一行：user_id=42, user_name="Ada", status_code=1
+      ↓ resultMap 负责列→属性的对应关系
+Java 对象：User{id=42, name="Ada", status=...}
+      ↑ TypeHandler 负责 status_code 的整数→枚举转换
+```
+
+插入时的主键回填是反向的便利：数据库生成主键后，MyBatis/JDBC 尝试把生成值写回传入的 Java 对象，例如 `user.setId(1001L)`。它不是从数据库“自动推断对象”，而是需要映射配置和驱动支持。
+
 **自动映射规则**：`autoMappingBehavior` 取 NONE/PARTIAL（默认）/FULL；PARTIAL 只自动映射没有嵌套 resultMap 的字段；`mapUnderscoreToCamelCase` 控制 `create_time` → `createTime`（MyBatis 原生默认 false，**MyBatis-Plus 默认开启**，Boot 项目通常在 `mybatis.configuration` 显式配置）。字段名与属性名不一致时，用 `<resultMap>` 的 `<result column property>` 或 `@Results/@Result` 显式指定。
 
 **自定义 TypeHandler**：实现 `TypeHandler<T>`（或继承 `BaseTypeHandler<T>`）并通过 `@MappedTypes`/`@MappedJdbcTypes` 声明，或在 XML 的 `typeHandler` 属性上指定、或全局注册 `type-handlers-package`。典型用途：枚举 ↔ DB 值转换、JSON 字段 ↔ 对象、加密字段自动加解密。
@@ -357,6 +488,21 @@ public class StatusEnumTypeHandler extends BaseTypeHandler<StatusEnum> {
 
 ## 8. 批量操作与性能
 ### 8.1 核心原理
+
+“批量”有两种完全不同的东西：一条 SQL 里放很多行，或者把多条参数不同但结构相同的 SQL 暂存起来交给 JDBC 批量发送。它们减少数据库往返的方式和限制不同。
+
+```text
+foreach 多值 INSERT：
+MyBatis 生成一条很长的 INSERT ... VALUES (...), (...), (...)
+→ 数据库执行一条 SQL
+
+ExecutorType.BATCH：
+Java 循环调用同一条 INSERT
+→ MyBatis 暂存每次的参数组 → flushStatements 时交给 JDBC executeBatch
+→ 仍是多组操作，不是 Mapper 一调用就立即写入
+```
+
+`flushStatements()` 的产物通常是批次执行结果（如 `BatchResult`，含本批语句与参数组的执行反馈）；它表示把暂存的批次送给驱动执行，**不等于事务提交**。事务仍可在之后提交或回滚。
 
 | 方案 | 写法 | 特点 |
 | --- | --- | --- |
@@ -402,6 +548,22 @@ jdbc:mysql://127.0.0.1:3306/db?rewriteBatchedStatements=true&useServerPrepStmts=
 
 ## 9. Spring Boot 整合与多数据源
 ### 9.1 核心原理
+Spring Boot Starter 的工作是把常见“组装零件”的步骤自动做掉，不是绕开 MyBatis。典型链路是：先从配置得到 DataSource，再用 DataSource 和 Mapper 配置创建 SqlSessionFactory，接着创建 SqlSessionTemplate，最后扫描 Mapper 接口并让它们使用正确的 Template。
+
+```text
+application.yml + 数据库驱动
+          ↓
+DataSource（连接池，负责取得 JDBC Connection）
+          ↓
+SqlSessionFactory（MyBatis 配置 + SQL/Mapper 注册）
+          ↓
+SqlSessionTemplate（Spring 调用入口，关联事务与 SqlSession）
+          ↓
+Mapper 代理（业务代码注入并调用）
+```
+
+这个顺序的意义是：Mapper 必须知道用哪个 SqlSessionTemplate；Template 必须知道用哪个 Factory；Factory 必须连到正确的 DataSource。多数据源时要把这条链一套一套配清楚，否则可能出现 Mapper 查错库或事务管理了另一个数据源。
+
 **整合方式**：`mybatis-spring-boot-starter`（或 MyBatis-Plus 的 starter）自动配置 `SqlSessionFactory`、`SqlSessionTemplate`、`MapperScannerConfigurer`；常用配置项：`mybatis.mapper-locations`（XML 位置）、`mybatis.type-aliases-package`、`mybatis.configuration.*`（驼峰、缓存、超时）、`mybatis.type-handlers-package`；接口用 `@Mapper` 或统一 `@MapperScan`。
 
 **多数据源**：每个数据源一套 `DataSource + SqlSessionFactory + SqlSessionTemplate + MapperScannerConfigurer`，在 `@MapperScan(basePackages="com.x.a.mapper", sqlSessionTemplateRef="aSqlSessionTemplate")` 里区分（**注意 Mapper 包必须互斥**，同一包不能被两个 `@MapperScan` 扫到）。
@@ -445,6 +607,10 @@ public class DataSourceAspect {
 
 ## 10. MyBatis-Plus 常用能力
 ### 10.1 核心原理
+
+MyBatis-Plus（MP）可以看作 MyBatis 的“常用操作工具箱”：单表增删改查时，它按实体和方法调用生成常见 SQL，减少重复 XML；复杂查询仍可使用普通 Mapper XML。它生成的 SQL 最终仍然走 MyBatis → JDBC → 数据库，所以索引、事务、注入和慢 SQL 等规则没有改变。
+
+例如 `userMapper.selectById(42L)` 的调用结果不是“MP 直接访问数据库”，而是 MP 根据实体映射生成/选择 SQL，再交给 MyBatis 的 Executor 执行。分页、租户、乐观锁等 InnerInterceptor 则在 SQL 执行过程中检查或改写 SQL；要通过日志确认最终送到数据库的内容。
 
 | 能力 | 用法 | 要点 |
 | --- | --- | --- |
@@ -494,6 +660,10 @@ MP = BaseMapper + Wrapper + 插件（分页/乐观锁/多租户/防全表）；�
 
 ## 11. ORM 选型、慢 SQL 与常见坑
 ### 11.1 核心原理
+
+ORM 的目标是让程序更方便地用对象表达数据库读写，但它不会消除 SQL、索引和网络往返。MyBatis 让开发者明确写 SQL、框架负责参数与结果映射；Hibernate/JPA 根据对象关系和操作自动生成不少 SQL，省去部分手写工作，但要理解它何时发 SQL、如何缓存和加载关联。
+
+慢 SQL 排查也可以用一句话概括：**先确认应用最终发了什么 SQL、带了什么参数，再看数据库实际怎么执行它，最后调整并用相同数据验证。**只看 Mapper 方法名或 XML 模板，无法判断动态条件、插件改写后的最终 SQL，也无法判断索引是否被采用。
 
 | 维度 | MyBatis | JPA / Hibernate |
 | --- | --- | --- |
